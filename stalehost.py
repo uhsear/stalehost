@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 r"""Find every ArcGIS file on a workstation that still names the host you are retiring, and never call a tree clean that you could not finish reading.
 
-Point it at a machine and it walks the local fixed drives for .aprx, .lyrx and
-.sde files, decides whether each one still names the old host as a whole token,
+Point it at a machine and it walks the local fixed drives for .aprx, .lyrx,
+.sde and a short list of plain text types -- .py, .bat, .cmd, .ps1, .sql and
+.ini -- decides whether each one still names the old host as a whole token,
 and prints one line an operator can read in a fleet grid. Every way the scan can
 fall short -- a directory it could not enumerate, a project it could not open,
 a clock that ran out -- has its own counter and its own verdict. A tree that was
@@ -17,13 +18,17 @@ UTF-16LE with no BOM, in the middle of a binary file, at whatever byte offset
 the property set lands on. And a substring match cannot tell OLDHOST-1 from
 OLDHOST-10, which is the neighbouring server that must not be touched. The last
 gap is the verdict: `grep -r` exits 0 or 1 whether or not it could read the
-tree, so a permission-denied profile looks exactly like a clean one.
+tree, so a permission-denied profile looks exactly like a clean one. On the
+text bucket alone ripgrep wins and this tool does not pretend otherwise. What
+it has is one verdict across a ZIP, a UTF-16LE property set and text together,
+with an exit code built for a detect-and-remediate loop.
 
     python stalehost.py --self-test
     python stalehost.py OLDHOST-1
     python stalehost.py OLDHOST-1 --path D:\GIS
     python stalehost.py OLDHOST-1 --json
     python stalehost.py OLDHOST-1 --fail-on-sde
+    python stalehost.py OLDHOST-1 --text-ext .txt,.config --fail-on-text
 
 Exit codes: 0 nothing to remediate, 1 stale content found or the scan could not
 be trusted, 64 usage error. Read EXIT CODE POLARITY below before changing them.
@@ -40,13 +45,15 @@ output means "found". Do not carry that habit here.
     exit 1 -- the device has remediable work, or cannot be proven not to:
       1. a stale .aprx or .lyrx was found                     (STALE)
       2. the scan hit --max-seconds before finishing          (INCOMPLETE)
-      3. a scan root could not be enumerated, or a .aprx or
-         .lyrx could not be read, so the device is unproven   (UNVERIFIED)
+      3. a scan root could not be enumerated, or a .aprx, a
+         .lyrx or a text file could not be read, so the
+         device is unproven                                   (UNVERIFIED)
       4. the tool itself threw                                (ERROR)
 
     exit 0 -- nothing for the remediation to do:
       5. no stale content at all                              (CLEAN)
-      6. stale .sde only. See WHY .sde IS INVENTORY below     (SDEONLY)
+      6. stale text only. See WHY TEXT IS INVENTORY below     (TEXTONLY)
+      7. stale .sde only. See WHY .sde IS INVENTORY below     (SDEONLY)
 
 Cases 2 to 4 fail TOWARD remediation on purpose. A remediation that is
 idempotent changes nothing on a clean device, whereas a missed device means
@@ -66,6 +73,21 @@ repointed. Without ArcGIS Pro on the device, arcpy cannot rewrite one at all.
 Letting .sde set exit 1 makes the loop re-run a remediation forever on a device
 it can never clean. The sde= count is the manual worklist instead. Pass
 --fail-on-sde only when your remediation really can fix them.
+
+WHY TEXT IS INVENTORY TOO, AND WHY IT IS SCANNED AT ALL. The first version of
+this tool read three ArcGIS formats and nothing else. Pointed at a 743-file
+legacy automation share where 158 files named the retiring host, one of them
+running nightly under Task Scheduler, it printed CLEAN over scanned=0. The
+PowerShell one-liner this tool exists to replace would have found all 158. A
+detector that cannot see what its own remediation fixes is worse than the thing
+it replaced, so the text bucket is not optional.
+
+It does not set exit 1 by default, for a different reason than .sde. The
+extension list is a guess about somebody else's fleet, and a host name in a
+.txt is often prose rather than a connection, so promoting text to work would
+change the exit code under remediations that are already deployed. --fail-on-
+text promotes it, --text-ext widens it, and both counts are on the line either
+way. An unread text file is UNVERIFIED regardless: only .sde has an excuse.
 """
 
 from __future__ import print_function
@@ -88,14 +110,27 @@ FIXABLE_EXTENSIONS = (".aprx", ".lyrx")
 # Extensions reported as inventory only. See WHY .sde IS INVENTORY above.
 INVENTORY_EXTENSIONS = (".sde",)
 
+# Plain text that names a host in a connection. A scheduled .py is the common
+# one: on a 743-file legacy automation share, 158 files named the retiring host,
+# one of them ran nightly under Task Scheduler, and this tool read none of them
+# and printed CLEAN over scanned=0. The list is short on purpose -- these six
+# are script and configuration types, where a host name is a connection rather
+# than prose. .txt is deliberately absent: a readme that mentions a server is
+# not a broken job. Add it, or anything else your fleet uses, with --text-ext.
+TEXT_EXTENSIONS = (".py", ".bat", ".cmd", ".ps1", ".sql", ".ini")
+
+# The two buckets whose membership is fixed. The text bucket is composed per
+# run, because --text-ext extends it.
 SCANNED_EXTENSIONS = FIXABLE_EXTENSIONS + INVENTORY_EXTENSIONS
 
-# Sample paths printed. Fixable hits are sampled separately from .sde so that a
-# connection cache full of .sde cannot crowd the actionable .aprx and .lyrx
-# paths out of the report. A fleet console usually captures about 2048
-# characters of output; 5 + 3 lines of ~115 characters leaves room to spare.
+# Sample paths printed. Fixable hits are sampled separately from .sde and from
+# text so that a connection cache full of .sde, or a share full of scripts,
+# cannot crowd the actionable .aprx and .lyrx paths out of the report. A fleet
+# console usually captures about 2048 characters of output; 5 + 3 + 3 lines of
+# ~115 characters leaves room to spare.
 SAMPLE_CAP = 5
 SDE_SAMPLE_CAP = 3
+TEXT_SAMPLE_CAP = 3
 
 # Width a sample path is truncated to, from the left. The meaningful part of a
 # GIS project path is its end.
@@ -159,6 +194,7 @@ STALE = "STALE"
 INCOMPLETE = "INCOMPLETE"
 UNVERIFIED = "UNVERIFIED"
 SDEONLY = "SDEONLY"
+TEXTONLY = "TEXTONLY"
 CLEAN = "CLEAN"
 ERROR = "ERROR"
 
@@ -246,6 +282,31 @@ def looks_like_zip(head):
     return head[:len(ZIP_MAGIC)] == ZIP_MAGIC
 
 
+def text_extensions(extra=None, defaults=TEXT_EXTENSIONS):
+    """The text bucket for this run: the defaults plus whatever --text-ext adds.
+
+    Each entry is lower-cased and given its leading dot, so "BAT", ".BAT" and
+    ".bat" are one extension and not three. An extension another bucket already
+    owns is refused rather than accepted and quietly ignored: an .aprx is a ZIP
+    and an .sde is a binary property set, and reading either as plain text
+    reports a file that plainly needs the fix as already repointed.
+    """
+    bucket = list(defaults)
+    for item in extra or []:
+        for part in item.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            if not name.startswith("."):
+                name = "." + name
+            if name in SCANNED_EXTENSIONS:
+                raise ValueError(
+                    "%s is not plain text and is already scanned" % name)
+            if name not in bucket:
+                bucket.append(name)
+    return tuple(bucket)
+
+
 def normalise(path):
     """Lower-case a path and make its separators comparable across platforms."""
     return path.replace("\\", "/").lower()
@@ -281,14 +342,14 @@ def has_reparse_attribute(attributes):
     return bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def verdict(walk, sde_is_work=False):
+def verdict(walk, sde_is_work=False, text_is_work=False):
     """Return (state, exit code) for a finished walk. The whole decision.
 
     Kept in one function with no I/O so the exit code a fleet tool acts on can
     be asserted directly rather than inferred from a scan.
     """
     fixable = walk.aprx + walk.lyrx
-    if fixable or (sde_is_work and walk.sde):
+    if fixable or (sde_is_work and walk.sde) or (text_is_work and walk.text):
         return STALE, 1
     if walk.timed_out:
         return INCOMPLETE, 1
@@ -296,8 +357,20 @@ def verdict(walk, sde_is_work=False):
         return UNVERIFIED, 1
     if walk.unreadable_fix:
         return UNVERIFIED, 1
+    # An unread text file leaves the device unproven whether or not text counts
+    # as work, because it is the ordinary contract: a tree that could not be
+    # finished is never reported clean. The .sde carve-out below is the one
+    # exception, and it is bought by a measurement -- 1157 DBMS-authenticated
+    # files on one workstation, none of them repointable. Nothing measured says
+    # a locked .py is that common, so it does not get the same excuse.
+    if walk.unreadable_text:
+        return UNVERIFIED, 1
     if sde_is_work and walk.unreadable_sde:
         return UNVERIFIED, 1
+    # Text outranks the .sde worklist in the report: a stale .py can be
+    # rewritten unattended, and a DBMS-authenticated .sde needs a person.
+    if walk.text:
+        return TEXTONLY, 0
     if walk.sde:
         return SDEONLY, 0
     return CLEAN, 0
@@ -310,20 +383,26 @@ def format_sample(path, width=SAMPLE_WIDTH):
     return "..." + path[-(width - 3):]
 
 
-def summary_line(state, host, walk, pro):
+def summary_line(state, host, walk, pro, text_exts=TEXT_EXTENSIONS):
     """The one line a fleet console captures. Paths and counts only."""
-    line = ("%s STALEHOST old=%s fix=%d (aprx=%d lyrx=%d) sde=%d scanned=%d "
-            "unreadable=%d elapsed=%ds pro=%s"
+    line = ("%s STALEHOST old=%s fix=%d (aprx=%d lyrx=%d) sde=%d text=%d "
+            "scanned=%d unreadable=%d elapsed=%ds pro=%s"
             % (state, host, walk.aprx + walk.lyrx, walk.aprx, walk.lyrx,
-               walk.sde, walk.scanned,
-               walk.unreadable_fix + walk.unreadable_sde, walk.elapsed, pro))
+               walk.sde, walk.text, walk.scanned,
+               walk.unreadable_fix + walk.unreadable_sde + walk.unreadable_text,
+               walk.elapsed, pro))
     # Printed only when they changed the verdict, so the common case stays short.
-    if walk.unreadable_fix:
-        line += " unverified=%d" % walk.unreadable_fix
+    if walk.unreadable_fix or walk.unreadable_text:
+        line += " unverified=%d" % (walk.unreadable_fix + walk.unreadable_text)
     if walk.root_failed:
         line += " rootfail=yes"
     if walk.timed_out:
         line += " timeout=yes"
+    # Always last, and always printed. A CLEAN that read no text at all is a
+    # different claim from a CLEAN that read the scripts too, and the line has
+    # to say which one it is. The grid truncates from the right, so this sits
+    # behind the counts that decide the verdict.
+    line += " textext=%s" % ",".join(e.lstrip(".") for e in text_exts)
     return line
 
 
@@ -332,20 +411,24 @@ class Walk(object):
 
     def __init__(self, aprx=0, lyrx=0, sde=0, unreadable_fix=0,
                  unreadable_sde=0, root_failed=False, timed_out=False,
-                 scanned=0, elapsed=0, samples=None, sde_samples=None):
+                 scanned=0, elapsed=0, samples=None, sde_samples=None,
+                 text=0, unreadable_text=0, text_samples=None):
         self.aprx = aprx
         self.lyrx = lyrx
         self.sde = sde
+        self.text = text                        # stale .py, .bat, .ps1, ...
         self.unreadable_fix = unreadable_fix    # unread .aprx or .lyrx
         self.unreadable_sde = unreadable_sde    # unread .sde
+        self.unreadable_text = unreadable_text  # unread text file
         self.root_failed = root_failed
         self.timed_out = timed_out
         self.scanned = scanned
         self.elapsed = elapsed
         self.samples = [] if samples is None else samples
         self.sde_samples = [] if sde_samples is None else sde_samples
+        self.text_samples = [] if text_samples is None else text_samples
 
-    def to_dict(self, state, code, host, pro):
+    def to_dict(self, state, code, host, pro, text_exts=TEXT_EXTENSIONS):
         return {
             "state": state,
             "exitCode": code,
@@ -354,15 +437,19 @@ class Walk(object):
             "aprx": self.aprx,
             "lyrx": self.lyrx,
             "sde": self.sde,
+            "text": self.text,
+            "textExtensions": list(text_exts),
             "scanned": self.scanned,
             "unreadableFixable": self.unreadable_fix,
             "unreadableSde": self.unreadable_sde,
+            "unreadableText": self.unreadable_text,
             "rootFailed": self.root_failed,
             "timedOut": self.timed_out,
             "elapsedSeconds": self.elapsed,
             "proInstalled": pro == "yes",
             "samples": list(self.samples),
             "sdeSamples": list(self.sde_samples),
+            "textSamples": list(self.text_samples),
         }
 
 
@@ -412,7 +499,7 @@ def zip_contains_host(path, host, max_entry=MAX_ENTRY_BYTES):
         archive.close()
 
 
-def file_contains_host(path, extension, host):
+def file_contains_host(path, extension, host, text_exts=TEXT_EXTENSIONS):
     """Dispatch by extension. Anything else, .mxd included, is not in scope."""
     if extension == ".aprx":
         # An .aprx is always a zip of CIM parts.
@@ -426,6 +513,11 @@ def file_contains_host(path, extension, host):
         return bytes_contain_host(read_bytes(path), host)
     if extension == ".sde":
         # Length-prefixed binary property sets. No text layer to decode.
+        return bytes_contain_host(read_bytes(path), host)
+    if extension in text_exts:
+        # Plain text, read as bytes and never decoded, so the file's encoding
+        # is a non-problem: bytes_contain_host matches an ASCII host and a
+        # UTF-16LE one alike, which is what a .ps1 saved by the ISE needs.
         return bytes_contain_host(read_bytes(path), host)
     return False
 
@@ -443,7 +535,8 @@ def is_reparse(entry):
 
 
 def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
-              matcher=None, lister=None, clock=time.time):
+              matcher=None, lister=None, clock=time.time,
+              text_exts=TEXT_EXTENSIONS):
     """Walk the roots and count what names the host. Never raises for one file.
 
     An explicit stack, not os.walk and not a recursive helper. The equivalent
@@ -454,7 +547,10 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
     verdict reflects it.
     """
     if matcher is None:
-        matcher = file_contains_host
+        # Wrapped rather than passed straight through, so the seam a test
+        # replaces keeps its three-argument shape whatever the text bucket is.
+        def matcher(path, extension, target):
+            return file_contains_host(path, extension, target, text_exts)
     if lister is None:
         # Replaced only by the self-test, which cannot create an access-denied
         # directory or a junction on every host it has to be green on. clock is
@@ -462,6 +558,7 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
         # against a clock that does not move between two reads of it.
         lister = os.scandir
     walk = Walk()
+    scanned_extensions = SCANNED_EXTENSIONS + tuple(text_exts)
     root_keys = set(normalise(root) for root in roots)
     started = clock()
     stack = list(roots)
@@ -494,7 +591,7 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
             except OSError:
                 continue
             extension = os.path.splitext(entry.name)[1].lower()
-            if extension not in SCANNED_EXTENSIONS:
+            if extension not in scanned_extensions:
                 continue
             walk.scanned += 1
             try:
@@ -507,22 +604,28 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
                 # would not have fixed it anyway.
                 if extension in INVENTORY_EXTENSIONS:
                     walk.unreadable_sde += 1
-                else:
+                elif extension in FIXABLE_EXTENSIONS:
                     walk.unreadable_fix += 1
+                else:
+                    walk.unreadable_text += 1
                 continue
             if not hit:
                 continue
-            if extension == ".sde":
+            if extension in INVENTORY_EXTENSIONS:
                 walk.sde += 1
                 if len(walk.sde_samples) < SDE_SAMPLE_CAP:
                     walk.sde_samples.append(entry.path)
-            else:
+            elif extension in FIXABLE_EXTENSIONS:
                 if extension == ".aprx":
                     walk.aprx += 1
                 else:
                     walk.lyrx += 1
                 if len(walk.samples) < SAMPLE_CAP:
                     walk.samples.append(entry.path)
+            else:
+                walk.text += 1
+                if len(walk.text_samples) < TEXT_SAMPLE_CAP:
+                    walk.text_samples.append(entry.path)
 
         for entry in subdirectories:
             if skip_directory(entry.name, entry.path, include_temp):
@@ -739,6 +842,24 @@ def self_test():
         check(not looks_like_zip(b'{"la'), "CIM JSON text is not a zip")
         check(not looks_like_zip(b"PK"), "a two byte file is not a zip")
 
+        # ---- the text bucket. The gap that printed CLEAN over 158 stale files.
+        check(".py" in text_extensions(),
+              "a .py is in the text bucket by default  <-- pinned defect")
+        check(".txt" not in text_extensions(),
+              "a .txt is not, because a readme naming a server is not a broken job")
+        check(text_extensions(["XML"])[-1] == ".xml",
+              "an added extension is lower-cased and given its leading dot")
+        check(text_extensions([".py"]) == TEXT_EXTENSIONS,
+              "an extension already in the bucket is not added twice")
+        check(text_extensions([".txt,.config"])[-2:] == (".txt", ".config"),
+              "one --text-ext value can carry a comma separated list")
+        check(text_extensions([" , "]) == TEXT_EXTENSIONS,
+              "an empty item is ignored rather than becoming an extension of '.'")
+        raises(lambda: text_extensions([".aprx"]),
+               "an extension another bucket owns is refused, not silently ignored  <-- pinned defect")
+        raises(lambda: text_extensions([".sde"]),
+               "and .sde too, because a property set read as text reports clean")
+
         # ---- real files, the three formats
         stale_lyrx = os.path.join(workdir, "stale_text.lyrx")
         decoy_lyrx = os.path.join(workdir, "decoy_text.lyrx")
@@ -794,6 +915,25 @@ def self_test():
         check(not bytes_contain_host(read_bytes(stale_aprx), host),
               "the raw .aprx bytes do not contain the host name  <-- pinned defect")
 
+        # ---- the text bucket on real files
+        stale_py = os.path.join(workdir, "nightly.py")
+        decoy_py = os.path.join(workdir, "neighbour.py")
+        wide_ps1 = os.path.join(workdir, "sync.ps1")
+        _write(stale_py, ('conn = "SERVER=%s;DATABASE=EXAMPLEDB"'
+                          % host).encode("utf-8"))
+        _write(decoy_py, ('conn = "SERVER=%s;DATABASE=EXAMPLEDB"'
+                          % decoy).encode("utf-8"))
+        _write(wide_ps1, ('$server = "%s"' % host).encode("utf-16-le"))
+
+        check(file_contains_host(stale_py, ".py", host),
+              "a .py naming the old host is a hit  <-- pinned defect")
+        check(not file_contains_host(decoy_py, ".py", host),
+              "the whole-token rule holds in the text bucket too")
+        check(file_contains_host(wide_ps1, ".ps1", host),
+              "a .ps1 saved as utf-16-le is a hit, because text is read as bytes")
+        check(not file_contains_host(stale_py, ".py", host, text_exts=(".bat",)),
+              "an extension this run did not include is not read  <-- pinned defect")
+
         # ---- read caps
         raises(lambda: read_bytes(stale_sde, max_bytes=4),
                "a file over the read cap is refused, not truncated")
@@ -843,6 +983,53 @@ def self_test():
         temp_walk = scan_tree([tree], host, include_temp=True)
         check(temp_walk.scanned == 7 and temp_walk.sde == 3,
               "--scan-temp reaches the scratch connection the default prunes")
+
+        # ---- the walk over a tree of scripts. Kept apart from the tree above
+        # so those counts still state the three-format case on their own.
+        text_tree = os.path.join(workdir, "text_tree")
+        os.makedirs(text_tree)
+        shutil.copy(stale_py, os.path.join(text_tree, "nightly.py"))
+        shutil.copy(decoy_py, os.path.join(text_tree, "neighbour.py"))
+        shutil.copy(wide_ps1, os.path.join(text_tree, "sync.ps1"))
+        _write(os.path.join(text_tree, "notes.txt"),
+               ("SERVER=%s" % host).encode("utf-8"))
+
+        text_walk = scan_tree([text_tree], host)
+        check(text_walk.scanned == 3 and text_walk.text == 2,
+              "the walk reads the two .py and the .ps1, leaves the .txt out, and clears the decoy  <-- pinned defect")
+        check(verdict(text_walk) == (TEXTONLY, 0),
+              "a tree whose only stale files are scripts is TEXTONLY, never CLEAN  <-- pinned defect")
+        check(verdict(text_walk, text_is_work=True) == (STALE, 1),
+              "--fail-on-text makes that same tree remediable work exit 1")
+        widened = scan_tree([text_tree], host,
+                            text_exts=text_extensions(["txt"]))
+        check(widened.scanned == 4 and widened.text == 3,
+              "--text-ext reaches the .txt the default bucket leaves out")
+        check(len(text_walk.text_samples) == 2 and text_walk.samples == []
+              and text_walk.sde_samples == [],
+              "text is sampled in its own list, so it cannot crowd out a project")
+
+        text_many = os.path.join(workdir, "text_many")
+        os.makedirs(text_many)
+        for number in range(5):
+            shutil.copy(stale_py, os.path.join(text_many, "job%d.py" % number))
+        text_many_walk = scan_tree([text_many], host)
+        # 3 is written out rather than read back from TEXT_SAMPLE_CAP, which
+        # would pass for whatever that constant was changed to.
+        check(text_many_walk.text == 5 and len(text_many_walk.text_samples) == 3,
+              "every stale script is counted but only three are sampled")
+
+        def refusing_text_matcher(path, extension, target):
+            if extension == ".py":
+                raise IOError("locked by another process")
+            return file_contains_host(path, extension, target)
+
+        unread_text = scan_tree([text_tree], host, matcher=refusing_text_matcher)
+        check(unread_text.unreadable_text == 2 and unread_text.unreadable_fix == 0
+              and unread_text.unreadable_sde == 0,
+              "an unread script is counted in its own counter  <-- pinned defect")
+        check(verdict(unread_text) == (UNVERIFIED, 1),
+              "and it leaves the device unproven with no flag needed  <-- pinned defect")
 
         # A corrupt project is the case that must not read as clean.
         broken_tree = os.path.join(workdir, "broken_tree")
@@ -1052,6 +1239,18 @@ def self_test():
               "and an unread .sde then leaves the device unproven")
         check(verdict(Walk(unreadable_sde=1)) == (CLEAN, 0),
               "without the flag that same device is CLEAN")
+        check(verdict(Walk(text=9)) == (TEXTONLY, 0),
+              "stale text alone is TEXTONLY exit 0 until a remediation can rewrite it")
+        check(verdict(Walk(text=9), text_is_work=True) == (STALE, 1),
+              "--fail-on-text turns that worklist into remediable work")
+        check(verdict(Walk(aprx=1, text=9)) == (STALE, 1),
+              "a pile of stale scripts does not mask one stale .aprx")
+        check(verdict(Walk(text=1, sde=9)) == (TEXTONLY, 0),
+              "text outranks the .sde worklist, because a .py can be rewritten unattended  <-- pinned defect")
+        check(verdict(Walk(unreadable_text=1)) == (UNVERIFIED, 1),
+              "an unread script is UNVERIFIED with no flag, unlike an unread .sde  <-- pinned defect")
+        check(TEXTONLY == "TEXTONLY",
+              "the seventh state word is the one the fleet rule greps for")
 
         # ---- the reported line
         line = summary_line(STALE, host, Walk(aprx=1, lyrx=2, sde=3, scanned=9,
@@ -1069,6 +1268,19 @@ def self_test():
         check("unverified=2" in trouble and "rootfail=yes" in trouble
               and "timeout=yes" in trouble,
               "each marker appears only when it changed the verdict")
+        text_line = summary_line(TEXTONLY, host, Walk(text=2, scanned=9), "yes")
+        check("text=2" in text_line, "the text count is on the line")
+        # The default bucket is written out, not joined from the constant. An
+        # assertion built from the constant passes for any bucket it holds.
+        check(text_line.endswith(" textext=py,bat,cmd,ps1,sql,ini"),
+              "and the line names the extensions that were read, so a CLEAN says what it covered  <-- pinned defect")
+        check(summary_line(CLEAN, host, Walk(), "yes",
+                           (".py",)).endswith(" textext=py"),
+              "a narrowed bucket is reported as narrowed")
+        unread_line = summary_line(UNVERIFIED, host, Walk(unreadable_text=2),
+                                   "yes")
+        check("unreadable=2" in unread_line and "unverified=2" in unread_line,
+              "an unread script is in the reported total, never lost  <-- pinned defect")
         check(format_sample("C:\\GIS\\Zoning.aprx") == "C:\\GIS\\Zoning.aprx",
               "a short sample path is printed whole")
         long_path = "C:\\GIS\\" + ("deep\\" * 40) + "Zoning.aprx"
@@ -1176,6 +1388,28 @@ def self_test():
         check(report["samples"] == [] and len(report["sdeSamples"]) == 1,
               "and it separates the actionable samples from the worklist")
 
+        # The defect this bucket was built for: a tree of scheduled scripts that
+        # name the retiring host used to read scanned=0 and CLEAN.
+        code, out = run([host, "--path", text_tree])
+        check(code == 0 and out.startswith("TEXTONLY "),
+              "a real scan of a stale script tree says TEXTONLY, never CLEAN  <-- pinned defect")
+        check("  txt " in out and "nightly.py" in out and "notes.txt" not in out,
+              "it prints the stale script paths and leaves the .txt out")
+        check("EXAMPLEDB" not in out,
+              "and it reports the path, never the connection string")
+        code, out = run([host, "--path", text_tree, "--fail-on-text"])
+        check(code == 1 and out.startswith("STALE "),
+              "--fail-on-text makes that same device exit 1  <-- pinned defect")
+        code, out = run([host, "--path", text_tree, "--text-ext", "txt",
+                         "--json"])
+        report = json.loads(out)
+        check(report["text"] == 3 and len(report["textSamples"]) == 3
+              and report["textExtensions"][-1] == ".txt",
+              "--json carries the text counts, the samples and the bucket read")
+        code, out = run([host, "--path", text_tree, "--text-ext", ".aprx"])
+        check(code == 64,
+              "a --text-ext that collides with another bucket is a usage error, exit 64")
+
         code, out = run([host, "--path", os.path.join(workdir, "nope")])
         check(code == 1 and out.startswith("ERROR "),
               "a mistyped scan root is an error exit 1, never a confident CLEAN  <-- pinned defect")
@@ -1189,6 +1423,14 @@ def self_test():
         check(args.old_server == host, "the old host name is read")
         check(args.fail_on_sde is False, "--fail-on-sde defaults to OFF")
         check(args.scan_temp is False, "--scan-temp defaults to OFF")
+        check(args.fail_on_text is False, "--fail-on-text defaults to OFF")
+        check(args.text_ext is None,
+              "--text-ext defaults to the documented bucket")
+        check(_parse([host, "--fail-on-text"]).fail_on_text is True,
+              "--fail-on-text is read")
+        check(_parse([host, "--text-ext", ".txt", "--text-ext",
+                      ".config"]).text_ext == [".txt", ".config"],
+              "--text-ext is repeatable")
         check(args.json is False, "--json defaults to OFF")
         check(args.path is None, "--path defaults to every local fixed drive")
         check(args.max_seconds == 600,
@@ -1242,6 +1484,18 @@ def _parse(argv):
                         help="treat a stale .sde as remediable work, so it sets "
                              "exit 1. Off by default: see WHY .sde IS INVENTORY "
                              "in the module docstring before turning it on.")
+    parser.add_argument("--fail-on-text", dest="fail_on_text",
+                        action="store_true",
+                        help="treat a stale text file as remediable work, so "
+                             "it sets exit 1. Off by default: the text bucket "
+                             "is a guess about your fleet, and flipping the "
+                             "exit code under a deployed remediation is not.")
+    parser.add_argument("--text-ext", dest="text_ext", action="append",
+                        metavar="EXT",
+                        help="add an extension to the text bucket, repeatable "
+                             "or comma separated, for example --text-ext "
+                             ".txt,.config (default: %s)"
+                             % ",".join(TEXT_EXTENSIONS))
     parser.add_argument("--scan-temp", dest="scan_temp", action="store_true",
                         help="include AppData\\Local\\Temp, where Pro leaves "
                              "thousands of scratch .sde connections")
@@ -1274,11 +1528,18 @@ def main(argv=None):
               "OLDHOST-1." % exc, file=sys.stderr)
         return 64
 
+    try:
+        text_exts = text_extensions(args.text_ext)
+    except ValueError as exc:
+        print("error: %s. Pass --text-ext only for plain text types."
+              % exc, file=sys.stderr)
+        return 64
+
     host = args.old_server.strip()
     try:
         roots = scan_roots(args.path)
         walk = scan_tree(roots, host, max_seconds=args.max_seconds,
-                         include_temp=args.scan_temp)
+                         include_temp=args.scan_temp, text_exts=text_exts)
     except Exception as exc:
         # Everything is caught here on purpose. A traceback on stderr and a
         # non-zero exit that means nothing in particular is how an unverified
@@ -1287,18 +1548,22 @@ def main(argv=None):
         print("%s STALEHOST %s" % (ERROR, exc))
         return 1
 
-    state, code = verdict(walk, args.fail_on_sde)
+    state, code = verdict(walk, args.fail_on_sde, args.fail_on_text)
     pro = "yes" if pro_installed() else "no"
 
     if args.json:
-        print(json.dumps(walk.to_dict(state, code, host, pro), indent=2))
+        print(json.dumps(walk.to_dict(state, code, host, pro, text_exts),
+                         indent=2))
         return code
 
-    print(summary_line(state, host, walk, pro))
+    print(summary_line(state, host, walk, pro, text_exts))
     # Paths only, never contents. Fixable hits first: those are the actionable
-    # ones, and a console capture is short.
+    # ones, and a console capture is short. Text next, because a text rewrite
+    # needs no ArcGIS licence, and the .sde worklist last.
     for path in walk.samples:
         print("  hit %s" % format_sample(path))
+    for path in walk.text_samples:
+        print("  txt %s" % format_sample(path))
     for path in walk.sde_samples:
         print("  sde %s" % format_sample(path))
     return code
