@@ -67,8 +67,22 @@ PASS  it reports paths and counts, never file contents  <-- pinned defect
 PASS  a mistyped scan root is an error exit 1, never a confident CLEAN  <-- pinned defect
 PASS  --fail-on-sde defaults to OFF
 PASS  --scan-temp defaults to OFF
+PASS  --fail-on-text defaults to OFF
+PASS  --text-ext defaults to the documented bucket
+PASS  --fail-on-text is read
+PASS  --text-ext is repeatable
+PASS  --json defaults to OFF
+PASS  --path defaults to every local fixed drive
+PASS  --max-seconds defaults to the measured 10x headroom
+PASS  --fail-on-sde is read
+PASS  --scan-temp is read
+PASS  --json is read
+PASS  --path is read
+PASS  --max-seconds is read
+PASS  --self-test parses
+PASS  a unique prefix of --fail-on-text is refused by the parser  <-- pinned defect
 ----------------------------------------------------------------------
-136 assertions, 0 failed
+177 assertions, 0 failed
 ```
 
 ## Requirements

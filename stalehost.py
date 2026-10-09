@@ -1444,6 +1444,19 @@ def self_test():
         check(_parse([host, "--max-seconds", "30"]).max_seconds == 30,
               "--max-seconds is read")
         check(_parse(["--self-test"]).self_test, "--self-test parses")
+        # A unique prefix of a real flag is refused, not read as that flag.
+        # With abbreviations on, --fail-on-t was taken for --fail-on-text.
+        saved_err = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            _parse([host, "--fail-on-t"])
+            refused = False
+        except SystemExit:
+            refused = True
+        finally:
+            sys.stderr = saved_err
+        check(refused, "a unique prefix of --fail-on-text is refused by "
+              "the parser  <-- pinned defect")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -1463,6 +1476,7 @@ def self_test():
 def _parse(argv):
     parser = argparse.ArgumentParser(
         prog="stalehost.py",
+        allow_abbrev=False,
         description="Find every ArcGIS file on this device that still names the "
                     "host you are retiring, and never call a tree clean that "
                     "could not be finished.",
