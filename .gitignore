@@ -11,3 +11,6 @@ logs/
 *.env
 credentials*
 *token*
+.coverage
+*.stalehost-bak-*
+*.stalehost-tmp

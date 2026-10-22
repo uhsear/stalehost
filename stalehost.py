@@ -29,6 +29,9 @@ with an exit code built for a detect-and-remediate loop.
     python stalehost.py OLDHOST-1 --json
     python stalehost.py OLDHOST-1 --fail-on-sde
     python stalehost.py OLDHOST-1 --text-ext .txt,.config --fail-on-text
+    python stalehost.py OLDHOST-1 --to NEWHOST
+    python stalehost.py OLDHOST-1 --to NEWHOST --apply
+    python stalehost.py OLDHOST-1 --to NEWHOST --apply --passwords-stdin < logins.json
 
 Exit codes: 0 nothing to remediate, 1 stale content found or the scan could not
 be trusted, 64 usage error. Read EXIT CODE POLARITY below before changing them.
@@ -67,19 +70,34 @@ the summary line, so both are diagnosable from the grid.
 WHY .sde IS INVENTORY AND NOT A VERDICT. A stale .sde is counted, sampled and
 reported, and by default it does not set exit 1, because the usual remediation
 cannot fix the .sde a real fleet has. A DBMS-authenticated .sde stores a
-database password, so repointing one needs a human to re-enter it: on the dry
-run that produced this tool, all 1157 .sde files found were DBMS-auth and 0 were
-repointed. Without ArcGIS Pro on the device, arcpy cannot rewrite one at all.
-Letting .sde set exit 1 makes the loop re-run a remediation forever on a device
-it can never clean. The sde= count is the manual worklist instead. Pass
---fail-on-sde only when your remediation really can fix them.
+database password, so repointing one needs a human to supply it: on the dry
+run that produced this tool, every one of the thousand-odd .sde files found was
+DBMS-auth and none was repointed. Without ArcGIS Pro on the device, arcpy cannot
+rewrite one at all. Letting .sde set exit 1 makes the loop re-run a remediation
+forever on a device it can never clean. The sde= count is the manual worklist
+instead. Pass --fail-on-sde only when your remediation really can fix them,
+which is the case after --to and --apply with Pro's Python and the passwords on
+stdin.
+
+WHAT --apply DOES, AND WHAT IT REFUSES. With --to NEWHOST the tool prints a plan
+and writes nothing. Adding --apply is the only way anything is written. An
+.aprx or .lyrx is rewritten in process: the new bytes are built beside the old
+file, read back with the matcher the scan uses, compared against the stat taken
+before the work began, and only then swapped in with os.replace, after a
+byte-checked backup. An .sde cannot be edited as bytes -- it is a length-prefixed
+property set -- so ArcGIS Pro's own Python rebuilds it with
+CreateDatabaseConnection in a child process. Passwords reach that child on its
+stdin and nowhere else: there is no flag for one and the environment is never
+read. Text files are not rewritten. After --apply the tree is scanned again and
+the exit code is the verdict for the tree as it now stands, so a file that could
+not be repointed still says STALE.
 
 WHY TEXT IS INVENTORY TOO, AND WHY IT IS SCANNED AT ALL. The first version of
-this tool read three ArcGIS formats and nothing else. Pointed at a 743-file
-legacy automation share where 158 files named the retiring host, one of them
-running nightly under Task Scheduler, it printed CLEAN over scanned=0. The
-PowerShell one-liner this tool exists to replace would have found all 158. A
-detector that cannot see what its own remediation fixes is worse than the thing
+this tool read three ArcGIS formats and nothing else. Pointed at a legacy
+automation share of several hundred files where about a fifth named the retiring
+host, one of them running nightly under Task Scheduler, it printed CLEAN over
+scanned=0. The PowerShell one-liner this tool exists to replace would have found
+every one of them. A detector that cannot see what its own remediation fixes is worse than the thing
 it replaced, so the text bucket is not optional.
 
 It does not set exit 1 by default, for a different reason than .sde. The
@@ -93,8 +111,11 @@ way. An unread text file is UNVERIFIED regardless: only .sde has an excuse.
 from __future__ import print_function
 
 import argparse
+import filecmp
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -111,9 +132,9 @@ FIXABLE_EXTENSIONS = (".aprx", ".lyrx")
 INVENTORY_EXTENSIONS = (".sde",)
 
 # Plain text that names a host in a connection. A scheduled .py is the common
-# one: on a 743-file legacy automation share, 158 files named the retiring host,
-# one of them ran nightly under Task Scheduler, and this tool read none of them
-# and printed CLEAN over scanned=0. The list is short on purpose -- these six
+# one: on a legacy automation share of several hundred files, about a fifth
+# named the retiring host, one of them ran nightly under Task Scheduler, and this
+# tool read none of them and printed CLEAN over scanned=0. The list is short on purpose -- these six
 # are script and configuration types, where a host name is a connection rather
 # than prose. .txt is deliberately absent: a readme that mentions a server is
 # not a broken job. Add it, or anything else your fleet uses, with --text-ext.
@@ -146,8 +167,8 @@ EXCLUDE_NAMES = frozenset([
 ])
 
 # ArcGIS Pro drops ephemeral GUID-named .sde connection files straight into
-# AppData\Local\Temp and never cleans them up: 2533 of them on the workstation
-# this was measured on, the single biggest cost in a full walk. They are
+# AppData\Local\Temp and never cleans them up: thousands of them on the
+# workstation this was measured on, the single biggest cost in a full walk. They are
 # per-session scratch, regenerated on the next launch, so repointing them is
 # pointless. --scan-temp includes them anyway. Slashes are normalised before
 # the comparison so the same rule can be tested on a non-Windows host.
@@ -171,6 +192,28 @@ MAX_ENTRY_BYTES = 64 * 1024 * 1024
 PRO_PYTHON = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
 PRO_REGISTRY_KEY = r"SOFTWARE\ESRI\ArcGISPro"
 
+# Remediation. Every file --apply replaces keeps its original beside it, under
+# this name plus a UTC time stamp. The tool never deletes a backup.
+BACKUP_MARK = ".stalehost-bak-"
+TEMP_MARK = ".stalehost-tmp"
+
+# The time one Pro Python process may spend rebuilding every .sde connection.
+# Each CreateDatabaseConnection call connects to the database, so a dead server
+# is a hang and not an error. The cap turns it into a counted failure.
+SDE_WORKER_SECONDS = 1800
+
+# The most that is read from stdin. A password list is a few kilobytes.
+STDIN_CAP = 1024 * 1024
+
+# The file the .sde worker runs from, in the child process. It is this file. The
+# self-test points it at a copy that sits beside a stand-in arcpy, because Pro's
+# own Python puts its real ArcPy ahead of anything on PYTHONPATH.
+WORKER_SCRIPT = os.path.abspath(__file__)
+
+# The prefix of each line the .sde worker prints, so the noise arcpy and Python
+# write to the same stream is never parsed as a result.
+RESULT_MARK = "STALEHOST-RESULT "
+
 # =============================================================================
 # End of CONFIGURATION.
 # =============================================================================
@@ -186,6 +229,15 @@ FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 # hyphen. Held as a set of ints because indexing a bytes object yields ints.
 WORD_BYTES = frozenset(
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")
+
+# Bytes a replacement host may hold: the token bytes plus '.' and '_'.
+HOST_BYTES = WORD_BYTES | frozenset(b"._")
+
+# Properties read off a connection with arcpy.Describe(...).connectionProperties.
+# Names are the documented ones, dbClient with its capital C included.
+SDE_PROPS = ("dbClient", "instance", "server", "database",
+             "authentication_mode", "user", "version", "branch",
+             "historical_name", "historical_timestamp")
 
 # Verdict states. The word leads the summary line because a fleet grid truncates
 # the output column from the right, and every row otherwise opened with the same
@@ -222,8 +274,8 @@ def host_needles(host):
     return ascii_needle, lowered.encode("utf-16-le")
 
 
-def find_token(haystack, needle, wide):
-    """True when needle appears in haystack as a whole token.
+def token_spans(haystack, needle, wide):
+    """Yield the start index of every whole-token match of needle in haystack.
 
     Both arguments are already lower-cased bytes. The boundary is symmetric: the
     character on either side must not be a letter, a digit or a hyphen, so
@@ -238,12 +290,12 @@ def find_token(haystack, needle, wide):
                 alignment the surrounding binary file put it on.
     """
     if not needle or len(haystack) < len(needle):
-        return False
+        return
     start = 0
     while True:
         index = haystack.find(needle, start)
         if index < 0:
-            return False
+            return
         start = index + 1
         after = index + len(needle)
         if wide:
@@ -258,7 +310,14 @@ def find_token(haystack, needle, wide):
                 continue
             if after < len(haystack) and _is_word_byte(haystack[after]):
                 continue
+        yield index
+
+
+def find_token(haystack, needle, wide):
+    """True when needle appears in haystack as a whole token. See token_spans."""
+    for _ in token_spans(haystack, needle, wide):
         return True
+    return False
 
 
 def bytes_contain_host(raw, host):
@@ -360,8 +419,8 @@ def verdict(walk, sde_is_work=False, text_is_work=False):
     # An unread text file leaves the device unproven whether or not text counts
     # as work, because it is the ordinary contract: a tree that could not be
     # finished is never reported clean. The .sde carve-out below is the one
-    # exception, and it is bought by a measurement -- 1157 DBMS-authenticated
-    # files on one workstation, none of them repointable. Nothing measured says
+    # exception, and it is bought by a measurement -- over a thousand
+    # DBMS-authenticated files on one workstation, none of them repointable. Nothing measured says
     # a locked .py is that common, so it does not get the same excuse.
     if walk.unreadable_text:
         return UNVERIFIED, 1
@@ -374,6 +433,157 @@ def verdict(walk, sde_is_work=False, text_is_work=False):
     if walk.sde:
         return SDEONLY, 0
     return CLEAN, 0
+
+
+# ------------------------------------------------- remediation core (pure)
+
+def check_new_host(new, old):
+    """Return the replacement host, stripped, or raise ValueError.
+
+    Three refusals. The name must be a plain host name, because it is written
+    into JSON strings and binary property sets where a quote, a backslash or a
+    comma would corrupt the file. It must be ASCII for the same reason the old
+    host must. And it must not contain the old host as a whole token: if
+    OLDHOST-1 became OLDHOST-1.example.org, the next run would find the old host
+    again and rewrite it to OLDHOST-1.example.org.example.org.
+    """
+    if new is None or not new.strip():
+        raise ValueError("replacement host is empty")
+    name = new.strip()
+    try:
+        raw = name.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("replacement host must be ASCII: %s" % new)
+    if any(byte not in HOST_BYTES for byte in raw):
+        raise ValueError("replacement host may hold only letters, digits, "
+                         "'.', '-' and '_': %s" % name)
+    if find_token(raw.lower(), host_needles(old)[0], False):
+        raise ValueError("replacement host still names the old host as a "
+                         "token, so a second run would rewrite it again")
+    return name
+
+
+def rewrite_host(raw, host, new):
+    """Return (bytes with every whole-token host replaced, replacement count).
+
+    The old host is found with the same rule the scan uses, in ASCII and in
+    UTF-16LE. The replacement is written in the encoding it replaced, so a
+    UTF-16LE .lyrx stays UTF-16LE. Two matches that overlap, as "a.a" does
+    inside "a.a.a", are not both replaced: the first wins and the verification
+    that follows every rewrite catches whatever is left.
+    """
+    lowered = raw.lower()
+    ascii_needle, wide_needle = host_needles(host)
+    new_ascii = new.encode("ascii")
+    new_wide = new.encode("utf-16-le")
+    edits = [(index, len(ascii_needle), new_ascii)
+             for index in token_spans(lowered, ascii_needle, False)]
+    edits += [(index, len(wide_needle), new_wide)
+              for index in token_spans(lowered, wide_needle, True)]
+    edits.sort()
+    pieces = []
+    cursor = 0
+    count = 0
+    for start, length, replacement in edits:
+        if start < cursor:
+            continue
+        pieces.append(raw[cursor:start])
+        pieces.append(replacement)
+        cursor = start + length
+        count += 1
+    pieces.append(raw[cursor:])
+    return b"".join(pieces), count
+
+
+def backup_path(path, now, exists=os.path.exists):
+    """A backup name that does not exist yet: stamped, and numbered on a clash.
+
+    A second run in the same second must not overwrite the first backup, which
+    is the only copy of the original.
+    """
+    base = "%s%s%s" % (path, BACKUP_MARK,
+                       time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)))
+    candidate = base
+    number = 0
+    while exists(candidate):
+        number += 1
+        candidate = "%s.%d" % (base, number)
+    return candidate
+
+
+def sde_temp_path(path):
+    """Where the new connection is built, beside the old one.
+
+    Beside it so the final rename never crosses a volume. An .sde name must end
+    in .sde, so the marker goes before the extension.
+    """
+    stem = os.path.splitext(path)[0]
+    return stem + "-stalehost-tmp.sde"
+
+
+def scrub(text, secrets):
+    """Replace every secret in text with ***. Longest first, so a password that
+    holds another one is removed whole."""
+    for secret in sorted(secrets, key=len, reverse=True):
+        text = text.replace(secret, "***")
+    return text
+
+
+def parse_passwords(data):
+    """Parse the JSON object on stdin into {lower-case login: password}.
+
+    The error never quotes the input, because the input is the secret.
+    """
+    try:
+        loaded = json.loads(data.decode("utf-8-sig"))
+    except ValueError:
+        loaded = None
+    if not isinstance(loaded, dict) or not all(
+            isinstance(value, str) and value for value in loaded.values()):
+        raise ValueError("stdin must be one JSON object mapping each login to "
+                         "a non-empty password string")
+    return dict((key.lower(), value) for key, value in loaded.items())
+
+
+def sde_decision(props, host, new, passwords):
+    """Decide what to do with one .sde connection. Returns (action, detail, kwargs).
+
+    action is create, declined or needs-password. props are the strings read
+    from arcpy.Describe(...).connectionProperties, so this runs with no arcpy.
+    Nothing here is guessed: a connection that is not SQL Server, that is a
+    branch or historical connection, that does not name the old host in its
+    instance, or whose authentication mode is unknown is declined and left
+    exactly as it was.
+    """
+    if props["dbClient"].lower() != "sqlserver":
+        return "declined", "not a SQL Server connection", None
+    if props["branch"] or props["historical_name"] or props["historical_timestamp"]:
+        return "declined", "branch and historical connections are not repointed", None
+    current = props["instance"] or props["server"]
+    updated, count = rewrite_host(current.encode("utf-8"), host, new)
+    if not count:
+        return "declined", "the connection does not name the old host", None
+    kwargs = {"database_platform": "SQL_SERVER",
+              "instance": updated.decode("utf-8")}
+    if props["database"]:
+        kwargs["database"] = props["database"]
+    if props["version"]:
+        kwargs["version_type"] = "TRANSACTIONAL"
+        kwargs["version"] = props["version"]
+    mode = props["authentication_mode"].upper()
+    if mode == "OSA":
+        kwargs["account_authentication"] = "OPERATING_SYSTEM_AUTH"
+        return "create", "", kwargs
+    if mode != "DBMS":
+        return "declined", "unknown authentication mode", None
+    password = passwords.get(props["user"].lower())
+    if password is None:
+        return "needs-password", "a database login needs a password", None
+    kwargs["account_authentication"] = "DATABASE_AUTH"
+    kwargs["username"] = props["user"]
+    kwargs["password"] = password
+    kwargs["save_user_pass"] = "SAVE_USERNAME"
+    return "create", "", kwargs
 
 
 def format_sample(path, width=SAMPLE_WIDTH):
@@ -536,7 +746,7 @@ def is_reparse(entry):
 
 def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
               matcher=None, lister=None, clock=time.time,
-              text_exts=TEXT_EXTENSIONS):
+              text_exts=TEXT_EXTENSIONS, hits=None):
     """Walk the roots and count what names the host. Never raises for one file.
 
     An explicit stack, not os.walk and not a recursive helper. The equivalent
@@ -545,6 +755,9 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
     reads as a healthy device. A per-directory try/except degrades instead of
     lying: the directory is skipped, the counter that says so is raised, and the
     verdict reflects it.
+
+    hits, when a list is given, receives (path, extension) for every stale file,
+    not only the capped samples. The remediation needs all of them.
     """
     if matcher is None:
         # Wrapped rather than passed straight through, so the seam a test
@@ -611,6 +824,8 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
                 continue
             if not hit:
                 continue
+            if hits is not None:
+                hits.append((entry.path, extension))
             if extension in INVENTORY_EXTENSIONS:
                 walk.sde += 1
                 if len(walk.sde_samples) < SDE_SAMPLE_CAP:
@@ -638,10 +853,15 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
     return walk
 
 
-def _pro_in_registry(subkey=PRO_REGISTRY_KEY):
+def _import_winreg():
+    import winreg  # imported here so the tool runs on a non-Windows host
+    return winreg
+
+
+def _pro_in_registry(subkey=PRO_REGISTRY_KEY, importer=_import_winreg):
     """True when ArcGIS Pro is registered, whatever path it was installed to."""
     try:
-        import winreg  # imported here so the tool runs on a non-Windows host
+        winreg = importer()
     except ImportError:
         return False
     try:
@@ -669,11 +889,15 @@ def pro_installed(known_path=PRO_PYTHON, registry=None):
     return (registry or _pro_in_registry)()
 
 
-def _windows_drive_type(root):
+def _import_ctypes():
+    import ctypes  # imported here so the tool runs on a non-Windows host
+    return ctypes
+
+
+def _windows_drive_type(root, importer=_import_ctypes):
     """GetDriveTypeW for a drive root. 0, meaning unknown, off Windows."""
     try:
-        import ctypes  # imported here so the tool runs on a non-Windows host
-        return int(ctypes.windll.kernel32.GetDriveTypeW(root))
+        return int(importer().windll.kernel32.GetDriveTypeW(root))
     except (ImportError, AttributeError, OSError):
         return 0
 
@@ -709,6 +933,290 @@ def scan_roots(path, roots_source=None):
     return roots
 
 
+# ------------------------------------------------------- remediation (files)
+
+def describe_error(exc):
+    """One short line for a failure. The exception type first, then its text."""
+    return ("%s: %s" % (type(exc).__name__, exc))[:200]
+
+
+def result_row(path, status, detail="", backup=""):
+    return {"path": path, "status": status, "detail": detail, "backup": backup}
+
+
+def rewrite_zip(source_path, target_path, host, new, max_entry=MAX_ENTRY_BYTES):
+    """Copy an archive entry by entry with the host replaced. Return the count.
+
+    Names, order, time stamps, compression and attributes are kept, so the only
+    difference is the bytes of the parts that named the host. Every entry is
+    read through zipfile, which checks its CRC, so a damaged archive raises here
+    and is never half copied.
+    """
+    total = 0
+    source = zipfile.ZipFile(source_path)
+    try:
+        target = zipfile.ZipFile(target_path, "w")
+        try:
+            target.comment = source.comment
+            for info in source.infolist():
+                if info.file_size > max_entry:
+                    raise ValueError("entry %s is over the %d byte read cap"
+                                     % (info.filename, max_entry))
+                data, count = rewrite_host(source.read(info), host, new)
+                total += count
+                clone = zipfile.ZipInfo(info.filename, info.date_time)
+                clone.compress_type = info.compress_type
+                clone.external_attr = info.external_attr
+                clone.create_system = info.create_system
+                clone.comment = info.comment
+                target.writestr(clone, data)
+        finally:
+            target.close()
+    finally:
+        source.close()
+    return total
+
+
+def rewrite_into(path, extension, temp, host, new):
+    """Write the rewritten copy of one project file to temp. Return the count."""
+    if extension == ".aprx" or looks_like_zip(read_head(path, len(ZIP_MAGIC))):
+        return rewrite_zip(path, temp, host, new)
+    data, count = rewrite_host(read_bytes(path), host, new)
+    _write(temp, data)
+    return count
+
+
+def verify_rewrite(temp, extension, host, new):
+    """Refuse a rewritten file that still names the old host or lacks the new.
+
+    This reads the finished file with the same matcher the scan uses, so the
+    check is the one the next scan will make.
+    """
+    if file_contains_host(temp, extension, host):
+        raise ValueError("the rewritten file still names the old host")
+    if not file_contains_host(temp, extension, new):
+        raise ValueError("the rewritten file does not name the new host")
+
+
+def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
+            before_swap=None):
+    """Back up path, then put staged in its place. Return the backup path.
+
+    The order is the safety. The original is compared with the stat taken before
+    the work began, so a file someone saved in the meantime is refused and not
+    overwritten. The backup is compared byte for byte before anything is
+    replaced. If the rename itself fails, as it does when another process holds
+    the file open, the backup is removed again because nothing changed.
+    """
+    if before_swap is not None:
+        before_swap()
+    after = os.stat(path)
+    if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+        raise ValueError("the file changed while it was being rewritten")
+    backup = backup_path(path, now)
+    copy(path, backup)
+    if not filecmp.cmp(path, backup, shallow=False):
+        os.remove(backup)
+        raise ValueError("the backup does not match the original")
+    shutil.copymode(path, staged)
+    try:
+        replace(staged, path)
+    except Exception:
+        os.remove(backup)
+        raise
+    return backup
+
+
+def repoint_file(path, extension, host, new, now, replace=os.replace,
+                 copy=shutil.copy2, before_swap=None):
+    """Rewrite one .aprx or .lyrx in place. Return (count, backup path).
+
+    The new content is built beside the original and checked before anything
+    is replaced, so any failure leaves the original untouched.
+    """
+    before = os.stat(path)
+    temp = path + TEMP_MARK
+    try:
+        count = rewrite_into(path, extension, temp, host, new)
+        if not count:
+            raise ValueError("no whole-token match to rewrite")
+        verify_rewrite(temp, extension, host, new)
+        backup = swap_in(path, temp, before, now, replace, copy, before_swap)
+    finally:
+        if os.path.isfile(temp):
+            os.remove(temp)
+    return count, backup
+
+
+# --------------------------------------------------------- remediation (.sde)
+
+def _load_arcpy():
+    import arcpy  # only the worker under ArcGIS Pro's Python ever gets here
+    return arcpy
+
+
+def _sde_one(arcpy, path, job):
+    """Describe one connection, decide, and build the new one beside it."""
+    try:
+        described = arcpy.Describe(path).connectionProperties
+    except AttributeError:
+        # Seen on ArcGIS Pro 3.6: when the server in the file does not answer,
+        # Describe returns a generic object with no connectionProperties.
+        return "failed", ("arcpy cannot read the connection properties. "
+                          "Describe connects to the old host, which must "
+                          "still answer.")
+    props = dict((name, str(getattr(described, name, "") or ""))
+                 for name in SDE_PROPS)
+    action, detail, kwargs = sde_decision(props, job["old"], job["new"],
+                                          job["passwords"])
+    if action != "create":
+        return action, detail
+    temp = sde_temp_path(path)
+    # The tool page does not say whether an existing output is overwritten, so
+    # none is ever left to be.
+    if os.path.exists(temp):
+        os.remove(temp)
+    kwargs["out_folder_path"] = os.path.dirname(temp)
+    kwargs["out_name"] = os.path.basename(temp)
+    arcpy.management.CreateDatabaseConnection(**kwargs)
+    return "created", ""
+
+
+def sde_worker(job, loader, out):
+    """The child half of an .sde repoint. Runs under ArcGIS Pro's Python.
+
+    It reads nothing but its job and writes nothing but result lines, plus the
+    new connection files beside the old ones. Every message passes through
+    scrub, because an error from a database driver may quote the password it
+    was given.
+    """
+    arcpy = loader()
+    secrets = list(job["passwords"].values())
+    for path in job["files"]:
+        try:
+            status, detail = _sde_one(arcpy, path, job)
+        except Exception as exc:
+            status, detail = "failed", describe_error(exc)
+        out.write(RESULT_MARK + json.dumps(
+            {"path": path, "status": status,
+             "detail": scrub(detail, secrets)}) + "\n")
+    out.flush()
+    return 0
+
+
+def run_sde_worker(python, script, job, timeout=SDE_WORKER_SECONDS):
+    """Run the worker in a child process. Return ({path: (status, detail)}, problem).
+
+    The job, passwords included, goes down the child's stdin. It is never an
+    argument and never an environment variable, either of which another account
+    on the machine can read from the process list.
+    """
+    secrets = list(job["passwords"].values())
+    try:
+        child = subprocess.Popen([python, script, "--sde-worker", "--apply"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+    except OSError as exc:
+        return {}, scrub(describe_error(exc), secrets)
+    try:
+        out, err = child.communicate(json.dumps(job).encode("utf-8"),
+                                     timeout=timeout)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.communicate()
+        return {}, "the ArcGIS Pro Python did not finish in %d seconds" % timeout
+    results = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        if line.startswith(RESULT_MARK):
+            try:
+                item = json.loads(line[len(RESULT_MARK):])
+            except ValueError:
+                continue
+            results[item["path"]] = (item["status"], item["detail"])
+    problem = ""
+    if child.returncode != 0:
+        tail = err.decode("utf-8", "replace").strip().splitlines()[-1:]
+        problem = scrub("the ArcGIS Pro Python exited %d %s"
+                        % (child.returncode, "".join(tail)[:120]), secrets)
+    return results, problem
+
+
+def repoint_sde(paths, host, new, apply, passwords, python, now, script,
+                timeout=SDE_WORKER_SECONDS):
+    """Rewrite or plan every stale .sde. Returns a list of result rows."""
+    if not os.path.isfile(python):
+        return [result_row(path, "left", "no ArcGIS Pro Python at the "
+                           "--pro-python path") for path in paths]
+    if not apply:
+        return [result_row(path, "would", "recreate with ArcGIS Pro Python")
+                for path in paths]
+    secrets = list(passwords.values())
+    befores = dict((path, os.stat(path)) for path in paths)
+    absolute = dict((os.path.abspath(path), path) for path in paths)
+    job = {"old": host, "new": new, "files": sorted(absolute),
+           "passwords": passwords}
+    reported, problem = run_sde_worker(python, script, job, timeout)
+    rows = []
+    for full in sorted(absolute):
+        path = absolute[full]
+        temp = sde_temp_path(path)
+        try:
+            status, detail = reported.get(
+                full, ("failed", problem or "the worker returned no result"))
+            if status == "created":
+                verify_rewrite(temp, ".sde", host, new)
+                backup = swap_in(path, temp, befores[path], now)
+                rows.append(result_row(path, "fixed", "recreated", backup))
+            else:
+                rows.append(result_row(path, status, scrub(detail, secrets)))
+        except Exception as exc:
+            rows.append(result_row(path, "failed",
+                                   scrub(describe_error(exc), secrets)))
+        finally:
+            if os.path.isfile(temp):
+                os.remove(temp)
+    return rows
+
+
+def repoint_all(hits, host, new, apply, passwords, python, now, script):
+    """Plan or perform the repoint for every hit. Returns a list of result rows.
+
+    Text files are left alone on purpose: a host name in a script is often a
+    decision and not a connection. The .aprx and .lyrx are rewritten in
+    process, with no ArcGIS licence. The .sde need ArcGIS Pro's Python.
+    """
+    rows = []
+    sde = []
+    for path, extension in sorted(hits):
+        if extension == ".sde":
+            sde.append(path)
+        elif extension not in FIXABLE_EXTENSIONS:
+            continue
+        elif not apply:
+            rows.append(result_row(path, "would", "rewrite in place"))
+        else:
+            try:
+                count, backup = repoint_file(path, extension, host, new, now)
+                rows.append(result_row(path, "fixed",
+                                       "%d replacement(s)" % count, backup))
+            except Exception as exc:
+                rows.append(result_row(path, "failed", describe_error(exc)))
+    if sde:
+        rows += repoint_sde(sde, host, new, apply, passwords, python, now,
+                            script)
+    return rows
+
+
+def read_stdin(stdin):
+    """Read the password JSON from a pipe. A terminal is refused, never prompted."""
+    if stdin.isatty():
+        raise ValueError("--passwords-stdin reads a pipe, not a terminal")
+    data = getattr(stdin, "buffer", stdin).read(STDIN_CAP + 1)
+    if len(data) > STDIN_CAP:
+        raise ValueError("stdin is over the %d byte cap" % STDIN_CAP)
+    return data
+
+
 # ------------------------------------------------------------------ self-test
 
 def _write(path, data):
@@ -739,22 +1247,83 @@ def _sde_fixture(path, host, encoding, pad=b"\x02\x00\x00\x00\x18\x00",
     _write(path, pad + host.encode(encoding) + tail)
 
 
-def self_test():
-    """Assertions over the matchers, the walk and the verdict. No network."""
-    import io
-    import shutil
-    import tempfile
+# The stand-in for arcpy that the self-test puts on the path of a child process.
+# It reads a connection file written as key=value lines and writes a new one the
+# same way, so the whole parent and child protocol runs with no ArcGIS install.
+# A behaviour key in the fixture makes it raise, hang, write nothing, or write a
+# connection that still names the old host.
+_ARCPY_STUB = r'''
+import os
+import time
 
+
+class _Props(object):
+    pass
+
+
+_state = {}
+
+
+def Describe(path):
+    props = _Props()
+    handle = open(path)
+    text = handle.read()
+    handle.close()
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            setattr(props, key, value)
+    _state["behaviour"] = getattr(props, "behaviour", "")
+    if _state["behaviour"] == "describe":
+        raise RuntimeError("cannot open this connection file")
+    if _state["behaviour"] == "noprops":
+        return _Props()
+    holder = _Props()
+    holder.connectionProperties = props
+    return holder
+
+
+class management(object):
+    @staticmethod
+    def CreateDatabaseConnection(**kw):
+        behaviour = _state["behaviour"]
+        if behaviour == "raise":
+            raise RuntimeError("login failed for password "
+                               + kw.get("password", ""))
+        if behaviour == "hang":
+            time.sleep(30)
+        if behaviour == "noout":
+            return
+        instance = "OLDHOST-1" if behaviour == "stale" else kw["instance"]
+        handle = open(os.path.join(kw["out_folder_path"], kw["out_name"]), "w")
+        handle.write("instance=%s\ndatabase=%s\nauth=%s\nuser=%s\n"
+                     "password_len=%d\n"
+                     % (instance, kw.get("database", ""),
+                        kw["account_authentication"], kw.get("username", ""),
+                        len(kw.get("password", ""))))
+        handle.close()
+'''
+
+
+def _harness(out=None):
+    """Return (check, raises, finish) over one pass and one fail counter.
+
+    Built by a function and not inline so the self-test can run a second copy
+    against cases that are meant to fail, and so see the failure paths work.
+    """
     passed = [0]
     failed = []
+
+    def say(text):
+        print(text, file=out or sys.stdout)
 
     def check(cond, label):
         if cond:
             passed[0] += 1
-            print("PASS  %s" % label)
+            say("PASS  %s" % label)
         else:
             failed.append(label)
-            print("FAIL  %s" % label)
+            say("FAIL  %s" % label)
 
     def raises(fn, label):
         try:
@@ -766,13 +1335,37 @@ def self_test():
         else:
             check(False, "%s (no error raised)" % label)
 
-    def run(argv):
+    def finish():
+        say("-" * 70)
+        total = passed[0] + len(failed)
+        if failed:
+            say("%d assertions, %d failed" % (total, len(failed)))
+            for label in failed:
+                say("  FAILED: %s" % label)
+            return 1
+        say("%d assertions, 0 failed" % total)
+        return 0
+
+    return check, raises, finish
+
+
+def self_test():
+    """Assertions over the matchers, the walk and the verdict. No network."""
+    import io
+    import tempfile
+    import types
+
+    global WORKER_SCRIPT
+    check, raises, finish = _harness()
+    saved_script = WORKER_SCRIPT
+
+    def run(argv, stdin=None, loader=None):
         """main() with both streams captured, returning (exit code, output)."""
         buffer = io.StringIO()
         saved = (sys.stdout, sys.stderr)
         sys.stdout, sys.stderr = buffer, buffer
         try:
-            code = main(argv)
+            code = main(argv, stdin, loader)
         finally:
             sys.stdout, sys.stderr = saved
         return code, buffer.getvalue()
@@ -780,7 +1373,7 @@ def self_test():
     host = "OLDHOST-1"
     decoy = "OLDHOST-10"
 
-    print("stalehost self-test: no arcpy, no network, no registry write")
+    print("stalehost self-test: stand-in arcpy, no network, no registry write")
     print("-" * 70)
 
     workdir = tempfile.mkdtemp(prefix="stalehost-test-")
@@ -842,7 +1435,7 @@ def self_test():
         check(not looks_like_zip(b'{"la'), "CIM JSON text is not a zip")
         check(not looks_like_zip(b"PK"), "a two byte file is not a zip")
 
-        # ---- the text bucket. The gap that printed CLEAN over 158 stale files.
+        # ---- the text bucket. The gap that printed CLEAN over stale scripts.
         check(".py" in text_extensions(),
               "a .py is in the text bucket by default  <-- pinned defect")
         check(".txt" not in text_extensions(),
@@ -1099,14 +1692,17 @@ def self_test():
             """The four members of an os.scandir entry that the walk uses."""
 
             def __init__(self, name, path, symlink=False, attributes=0,
-                         stat_raises=False):
+                         stat_raises=False, dir_raises=False):
                 self.name = name
                 self.path = path
                 self._symlink = symlink
                 self._attributes = attributes
                 self._stat_raises = stat_raises
+                self._dir_raises = dir_raises
 
             def is_dir(self, follow_symlinks=True):
+                if self._dir_raises:
+                    raise OSError(5, "cannot tell what this entry is")
                 return True
 
             def is_symlink(self):
@@ -1418,6 +2014,657 @@ def self_test():
         code, out = run(["   "])
         check(code == 64, "a blank host name is a usage error, exit 64")
 
+        # ====================================================================
+        # Remediation. Everything below writes only inside workdir.
+        # ====================================================================
+        new = "NEWHOST"
+
+        def outcome(fn):
+            """The exception fn raises, or None."""
+            try:
+                fn()
+            except Exception as exc:
+                return exc
+            return None
+
+        def snapshot(root):
+            """Every file under root with its bytes, to prove nothing moved."""
+            state = {}
+            for base, _dirs, names in os.walk(root):
+                for name in names:
+                    full = os.path.join(base, name)
+                    state[full] = read_bytes(full)
+            return state
+
+        def stale_copy(source, name):
+            target = os.path.join(workdir, name)
+            shutil.copy(source, target)
+            return target
+
+        def backups_of(name):
+            return [n for n in os.listdir(workdir)
+                    if n.startswith(name + BACKUP_MARK)]
+
+        # ---- the replacement host
+        check(check_new_host("  NewHost-2.example.org ", host)
+              == "NewHost-2.example.org",
+              "a replacement host is stripped and kept as typed")
+        check(check_new_host("OLDHOST-10", host) == "OLDHOST-10",
+              "a neighbouring name is a legal replacement, because the token rule clears it")
+        raises(lambda: check_new_host("", host),
+               "an empty replacement host is refused")
+        raises(lambda: check_new_host(None, host),
+               "a missing replacement host is refused")
+        raises(lambda: check_new_host(u"NEW\u00d6", host),
+               "a non-ASCII replacement host is refused")
+        raises(lambda: check_new_host("NEW\\INST", host),
+               "a backslash in the replacement is refused, because it would corrupt JSON  <-- pinned defect")
+        raises(lambda: check_new_host('NEW"HOST', host),
+               "a quote in the replacement is refused")
+        raises(lambda: check_new_host("a,b", host),
+               "a comma in the replacement is refused")
+        raises(lambda: check_new_host("OLDHOST-1.example.org", host),
+               "a replacement that still names the old host is refused, or a rerun would grow it  <-- pinned defect")
+        raises(lambda: check_new_host("oldhost-1", host),
+               "the old host itself, in any case, is refused")
+
+        # ---- rewriting bytes
+        check(rewrite_host(b"SERVER=OLDHOST-1;DB=X", host, new)
+              == (b"SERVER=NEWHOST;DB=X", 1),
+              "a whole-token host is replaced")
+        check(rewrite_host(b"SERVER=OLDHOST-10;", host, new)
+              == (b"SERVER=OLDHOST-10;", 0),
+              "the neighbouring server is left byte for byte  <-- pinned defect")
+        check(rewrite_host(b"server=oldhost-1", host, "NewHost")[0]
+              == b"server=NewHost",
+              "a match in any case is replaced by the name as typed")
+        wide_in = u"SERVER=OLDHOST-1;".encode("utf-16-le")
+        check(rewrite_host(wide_in, host, new)
+              == (u"SERVER=NEWHOST;".encode("utf-16-le"), 1),
+              "a utf-16-le host is replaced and stays utf-16-le  <-- pinned defect")
+        check(rewrite_host(b"\x00" + wide_in, host, new)
+              == (b"\x00" + u"SERVER=NEWHOST;".encode("utf-16-le"), 1),
+              "a utf-16-le host at an odd offset is replaced too")
+        both = b"a=OLDHOST-1;" + wide_in + b";z=OLDHOST-1"
+        both_out, both_count = rewrite_host(both, host, new)
+        check(both_count == 3 and not bytes_contain_host(both_out, host)
+              and bytes_contain_host(both_out, new),
+              "ASCII and utf-16-le copies in one buffer are all replaced")
+        check(rewrite_host(rewrite_host(b"x=OLDHOST-1", host, new)[0],
+                           host, new)[1] == 0,
+              "a second pass finds nothing, so a rerun is idempotent")
+        check(rewrite_host(b"a.a.a", "a.a", "N") == (b"N.a", 1),
+              "two overlapping matches are not both cut, which would shred the bytes  <-- pinned defect")
+
+        # ---- names, scrubbing and passwords
+        check(backup_path("C:\\a\\Zoning.aprx", 0, exists=lambda p: False)
+              == "C:\\a\\Zoning.aprx.stalehost-bak-19700101T000000Z",
+              "a backup is the file name plus a UTC time stamp")
+        taken = set(["p.stalehost-bak-19700101T000000Z",
+                     "p.stalehost-bak-19700101T000000Z.1"])
+        check(backup_path("p", 0, exists=lambda c: c in taken)
+              == "p.stalehost-bak-19700101T000000Z.2",
+              "a backup name that is taken is numbered, never overwritten  <-- pinned defect")
+        check(sde_temp_path("C:\\a\\b.sde") == "C:\\a\\b-stalehost-tmp.sde",
+              "the new connection is built beside the old one and still ends in .sde")
+        check(scrub("x abcdef y abc", ["abc", "abcdef"]) == "x *** y ***",
+              "a password that holds another is removed whole, longest first  <-- pinned defect")
+        check(parse_passwords(b'\xef\xbb\xbf{"SDE_User": "pw1", "Other": "p w2"}')
+              == {"sde_user": "pw1", "other": "p w2"},
+              "logins are matched without regard to case, and a BOM is tolerated")
+        for label, data in (
+                ("not JSON", b"not json at all TOPSECRET"),
+                ("a list", b'["TOPSECRET"]'),
+                ("a number for a password", b'{"u": 5, "m": "TOPSECRET"}'),
+                ("an empty password", b'{"u": ""}'),
+                ("not utf-8", b"\xff\xfe TOPSECRET")):
+            problem = outcome(lambda d=data: parse_passwords(d))
+            check(isinstance(problem, ValueError)
+                  and "TOPSECRET" not in str(problem),
+                  "stdin that is %s is refused without echoing it  <-- pinned defect"
+                  % label)
+
+        # ---- the decision for one .sde
+        def props(**changes):
+            base = dict((name, "") for name in SDE_PROPS)
+            base.update(dbClient="sqlserver", instance="OLDHOST-1\\SQLEXPRESS",
+                        database="EXAMPLEDB", authentication_mode="OSA")
+            base.update(changes)
+            return base
+
+        action, detail, kwargs = sde_decision(props(), host, new, {})
+        check(action == "create"
+              and kwargs["instance"] == "NEWHOST\\SQLEXPRESS"
+              and kwargs["account_authentication"] == "OPERATING_SYSTEM_AUTH"
+              and kwargs["database"] == "EXAMPLEDB"
+              and kwargs["database_platform"] == "SQL_SERVER"
+              and "password" not in kwargs,
+              "an OS-authenticated connection is rebuilt and needs no password")
+        action, detail, kwargs = sde_decision(
+            props(authentication_mode="DBMS", user="SDE_User"), host, new,
+            {"sde_user": "pw1"})
+        check(action == "create" and kwargs["username"] == "SDE_User"
+              and kwargs["password"] == "pw1"
+              and kwargs["account_authentication"] == "DATABASE_AUTH"
+              and kwargs["save_user_pass"] == "SAVE_USERNAME",
+              "a database login is rebuilt with the password for that login, matched in any case")
+        action, detail, kwargs = sde_decision(
+            props(authentication_mode="DBMS", user="sde_user"), host, new, {})
+        check(action == "needs-password" and kwargs is None
+              and "sde_user" not in detail,
+              "a login with no password supplied is left alone, and the login is not printed")
+        check(sde_decision(props(instance="OLDHOST-10"), host, new, {})[0]
+              == "declined",
+              "a connection to the neighbouring server is declined  <-- pinned defect")
+        check(sde_decision(props(instance="", server="OLDHOST-1"), host, new,
+                           {})[2]["instance"] == "NEWHOST",
+              "the server property stands in when the instance is empty")
+        check(sde_decision(props(dbClient="oracle"), host, new, {})[0]
+              == "declined",
+              "a connection that is not SQL Server is declined")
+        check(sde_decision(props(dbClient="SqlServer"), host, new, {})[0]
+              == "create",
+              "the client name is compared without regard to case")
+        check(sde_decision(props(branch="b1"), host, new, {})[0] == "declined"
+              and sde_decision(props(historical_name="m"), host, new,
+                               {})[0] == "declined"
+              and sde_decision(props(historical_timestamp="t"), host, new,
+                               {})[0] == "declined",
+              "branch and historical connections are declined, not flattened to default")
+        check(sde_decision(props(authentication_mode="AAD"), host, new,
+                           {})[0] == "declined",
+              "an authentication mode this tool does not know is declined")
+        kwargs = sde_decision(props(version="sde.DEFAULT", database=""), host,
+                              new, {})[2]
+        check(kwargs["version_type"] == "TRANSACTIONAL"
+              and kwargs["version"] == "sde.DEFAULT" and "database" not in kwargs,
+              "a version is carried over and an empty database is left out")
+
+        # ---- rewriting a zip
+        multi = os.path.join(workdir, "multi.aprx")
+        archive = zipfile.ZipFile(multi, "w", zipfile.ZIP_DEFLATED)
+        archive.comment = b"project comment"
+        archive.writestr("CIMPATH/", b"")
+        archive.writestr("CIMPATH/map.json", connection % host)
+        archive.writestr("CIMPATH/other.json", connection % "NEWHOST")
+        archive.writestr(zipfile.ZipInfo("stored.txt", (2020, 1, 2, 3, 4, 6)),
+                         b"SERVER=OLDHOST-1")
+        archive.close()
+        rewritten = os.path.join(workdir, "multi-rewritten.aprx")
+        zip_count = rewrite_zip(multi, rewritten, host, new)
+        old_zip = zipfile.ZipFile(multi)
+        new_zip = zipfile.ZipFile(rewritten)
+        check(zip_count == 2
+              and new_zip.read("CIMPATH/map.json")
+              == (connection % new).encode("utf-8")
+              and new_zip.read("stored.txt") == b"SERVER=NEWHOST"
+              and new_zip.read("CIMPATH/other.json")
+              == old_zip.read("CIMPATH/other.json"),
+              "every part naming the host is rewritten and the others are copied")
+        check([i.filename for i in old_zip.infolist()]
+              == [i.filename for i in new_zip.infolist()],
+              "part names and their order are kept")
+        check([(i.date_time, i.compress_type, i.external_attr)
+               for i in old_zip.infolist()]
+              == [(i.date_time, i.compress_type, i.external_attr)
+                  for i in new_zip.infolist()],
+              "time stamps, compression and attributes are kept, stored parts included")
+        check(new_zip.comment == b"project comment",
+              "the archive comment is kept")
+        old_zip.close()
+        new_zip.close()
+        raises(lambda: rewrite_zip(multi, rewritten, host, new, max_entry=8),
+               "a part over the read cap is refused, not skipped")
+        damaged = os.path.join(workdir, "damaged.aprx")
+        archive = zipfile.ZipFile(damaged, "w", zipfile.ZIP_STORED)
+        archive.writestr("CIMPATH/map.json", b"SERVER=OLDHOST-1;x")
+        archive.close()
+        # Same length, so the archive still parses and only the CRC is wrong.
+        _write(damaged, read_bytes(damaged).replace(b";x", b";y"))
+        check(isinstance(outcome(lambda: rewrite_zip(damaged, rewritten, host,
+                                                     new)),
+                         zipfile.BadZipFile),
+              "a part whose bytes no longer match its CRC stops the rewrite")
+
+        # ---- rewriting real project files in place
+        fixed_name = {}
+        for label, source, extension in (
+                ("an .aprx", stale_aprx, ".aprx"),
+                ("a text .lyrx", stale_lyrx, ".lyrx"),
+                ("a utf-16-le .lyrx", wide_lyrx, ".lyrx"),
+                ("a zipped .lyrx", zipped_lyrx, ".lyrx")):
+            name = "fix_%d%s" % (len(fixed_name), extension)
+            target = stale_copy(source, name)
+            original = read_bytes(target)
+            count, backup = repoint_file(target, extension, host, new, 0)
+            fixed_name[label] = target
+            check(count == 1 and read_bytes(backup) == original
+                  and os.path.basename(backup).startswith(name + BACKUP_MARK)
+                  and not file_contains_host(target, extension, host)
+                  and file_contains_host(target, extension, new)
+                  and not os.path.exists(target + TEMP_MARK),
+                  "%s is rewritten, backed up byte for byte, and leaves no temp file"
+                  % label)
+        check(read_bytes(fixed_name["a text .lyrx"])
+              == (connection % new).encode("utf-8"),
+              "the rewritten text .lyrx differs from the original only in the host")
+        check(read_bytes(fixed_name["a utf-16-le .lyrx"])
+              == (connection % new).encode("utf-16-le"),
+              "and the utf-16-le one is still utf-16-le  <-- pinned defect")
+        target = fixed_name["an .aprx"]
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".aprx", host, new, 0))
+        check(isinstance(problem, ValueError) and read_bytes(target) == original,
+              "a file already repointed is refused on a rerun and left alone  <-- pinned defect")
+        target = stale_copy(decoy_lyrx, "decoy_fix.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0))
+        check(isinstance(problem, ValueError) and read_bytes(target) == original
+              and not backups_of("decoy_fix.lyrx"),
+              "a file that names only the neighbouring server is never touched, and gets no backup")
+        target = fixed_name["a text .lyrx"]
+        first_backup = backups_of(os.path.basename(target))[0]
+        shutil.copy(stale_lyrx, target)
+        count, second_backup = repoint_file(target, ".lyrx", host, new, 0)
+        check(second_backup.endswith(".1")
+              and os.path.exists(os.path.join(workdir, first_backup)),
+              "a second backup in the same second is numbered and the first survives  <-- pinned defect")
+        target = stale_copy(broken_aprx, "broken_fix.aprx")
+        problem = outcome(lambda: repoint_file(target, ".aprx", host, new, 0))
+        check(isinstance(problem, zipfile.BadZipFile)
+              and read_bytes(target) == b"this is not a zip archive"
+              and not os.path.exists(target + TEMP_MARK),
+              "a project that will not open fails and is left exactly as it was")
+
+        def refusing_replace(staged, destination):
+            raise OSError(13, "the file is open in another process")
+
+        target = stale_copy(stale_lyrx, "locked.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               replace=refusing_replace))
+        check(isinstance(problem, OSError) and read_bytes(target) == original
+              and not os.path.exists(target + TEMP_MARK)
+              and not backups_of("locked.lyrx"),
+              "a rename that fails leaves the file, the temp file and the backups as they were  <-- pinned defect")
+
+        target = stale_copy(stale_lyrx, "moving.lyrx")
+        edited = b'{"edited": "by a person, with more bytes in it"}'
+        problem = outcome(lambda: repoint_file(
+            target, ".lyrx", host, new, 0,
+            before_swap=lambda: _write(target, edited)))
+        check(isinstance(problem, ValueError) and read_bytes(target) == edited
+              and not backups_of("moving.lyrx"),
+              "a file saved while it was being rewritten is not overwritten  <-- pinned defect")
+
+        def short_copy(source, destination):
+            _write(destination, b"short")
+
+        target = stale_copy(stale_lyrx, "badcopy.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               copy=short_copy))
+        check(isinstance(problem, ValueError) and read_bytes(target) == original
+              and not backups_of("badcopy.lyrx"),
+              "a backup that does not match the original stops the swap  <-- pinned defect")
+        raises(lambda: verify_rewrite(stale_lyrx, ".lyrx", host, new),
+               "a rewrite that still names the old host is refused")
+        raises(lambda: verify_rewrite(decoy_lyrx, ".lyrx", host, new),
+               "and one that never names the new host is refused too")
+        names_both = os.path.join(workdir, "names_both.lyrx")
+        _write(names_both, (connection % host).encode("utf-8")
+               + b" alias=NEWHOST")
+        raises(lambda: verify_rewrite(names_both, ".lyrx", host, new),
+               "and one that names the new host and still the old is refused  <-- pinned defect")
+        check(outcome(lambda: verify_rewrite(clean_lyrx, ".lyrx", host, new))
+              is None,
+              "a rewrite that names only the new host passes")
+
+        # ---- the walk hands back every stale path
+        hit_list = []
+        scan_tree([tree], host, hits=hit_list)
+        check(len(hit_list) == 4
+              and sorted(e for _p, e in hit_list)
+              == [".aprx", ".lyrx", ".sde", ".sde"],
+              "the walk returns every stale path with its extension, not only the samples")
+        many_hits = []
+        scan_tree([many], host, hits=many_hits)
+        check(len(many_hits) == 16,
+              "all sixteen stale files are returned though only eight are sampled  <-- pinned defect")
+        check(scan_tree([tree], host, lister=entry_lister(
+            FakeEntry("Odd", projects, dir_raises=True))).scanned == 0,
+              "an entry that will not say whether it is a directory is skipped, not fatal")
+
+        # ---- the .sde worker, against a stand-in for arcpy
+        stub_dir = os.path.join(workdir, "stub")
+        os.makedirs(stub_dir)
+        _write(os.path.join(stub_dir, "arcpy.py"), _ARCPY_STUB.encode("ascii"))
+        stub_module = types.ModuleType("arcpy")
+        exec(_ARCPY_STUB, stub_module.__dict__)
+        # A copy of this file beside the stand-in, so the child finds the stand-in
+        # first whichever Python runs the test.
+        script = os.path.join(stub_dir, "stalehost_copy.py")
+        shutil.copy(os.path.abspath(__file__), script)
+        WORKER_SCRIPT = script
+        # Joined at run time: the copy of this file in the stub folder is read by
+        # the password search below, and must not hold the secret itself.
+        secret = "S3cret" + "Pw"
+
+        def stub_sde(path, **properties):
+            lines = ["%s=%s" % item for item in sorted(properties.items())]
+            _write(path, ("\n".join(lines) + "\n").encode("ascii"))
+
+        osa = dict(dbClient="sqlserver", instance="OLDHOST-1\\SQLEXPRESS",
+                   database="EXAMPLEDB", authentication_mode="OSA")
+        dbms = dict(osa, authentication_mode="DBMS", user="sde_user")
+
+        proc_root = os.path.join(workdir, "proc")
+        os.makedirs(proc_root)
+        proc = dict((name, os.path.join(proc_root, name + ".sde"))
+                    for name in ("ok", "dec", "boom", "desc"))
+        stub_sde(proc["ok"], **osa)
+        _write(sde_temp_path(proc["ok"]), b"a leftover from a crashed run")
+        stub_sde(proc["dec"], **dict(osa, instance="OTHERHOST-9"))
+        stub_sde(proc["boom"], **dict(dbms, behaviour="raise"))
+        stub_sde(proc["desc"], **dict(osa, behaviour="describe"))
+        job = {"old": host, "new": new, "passwords": {"sde_user": secret},
+               "files": [proc[k] for k in ("ok", "dec", "boom", "desc")]}
+        sink = io.StringIO()
+        check(sde_worker(job, lambda: stub_module, sink) == 0,
+              "the worker finishes with exit 0 whatever happened to each file")
+        seen = {}
+        for line in sink.getvalue().splitlines():
+            item = json.loads(line[len(RESULT_MARK):])
+            seen[item["path"]] = item
+        check([seen[proc[k]]["status"] for k in ("ok", "dec", "boom", "desc")]
+              == ["created", "declined", "failed", "failed"],
+              "the worker reports one status per file: created, declined, failed, failed")
+        check(secret not in sink.getvalue() and "***" in seen[proc["boom"]]["detail"],
+              "an error that quotes the password has it scrubbed before it is printed  <-- pinned defect")
+        check(b"instance=NEWHOST\\SQLEXPRESS"
+              in read_bytes(sde_temp_path(proc["ok"])),
+              "a leftover temp connection is removed before a new one is built")
+        check(not os.path.exists(sde_temp_path(proc["dec"])),
+              "a declined connection builds nothing")
+        unreachable = os.path.join(proc_root, "np.sde")
+        stub_sde(unreachable, **dict(osa, behaviour="noprops"))
+        sink = io.StringIO()
+        sde_worker(dict(job, files=[unreachable]), lambda: stub_module, sink)
+        item = json.loads(sink.getvalue()[len(RESULT_MARK):])
+        check(item["status"] == "failed" and "must still answer" in item["detail"]
+              and not os.path.exists(sde_temp_path(unreachable)),
+              "a connection whose server does not answer is a clear failure, not a traceback  <-- pinned defect")
+
+        late = os.path.join(proc_root, "late.sde")
+        stub_sde(late, **osa)
+        late_job = json.dumps(dict(job, files=[late])).encode("utf-8")
+        code, out = run(["--sde-worker"], stdin=io.TextIOWrapper(
+            io.BytesIO(late_job)), loader=lambda: stub_module)
+        check(code == 64 and not os.path.exists(sde_temp_path(late)),
+              "the worker mode refuses to run without --apply, so nothing writes without it  <-- pinned defect")
+        code, out = run(["--sde-worker", "--apply"], stdin=io.TextIOWrapper(
+            io.BytesIO(late_job)), loader=lambda: stub_module)
+        check(code == 0 and out.startswith(RESULT_MARK)
+              and os.path.exists(sde_temp_path(late)),
+              "the worker mode reads its job from stdin and answers on stdout")
+        # The import is real, so a stand-in is put where the import looks.
+        real_arcpy = sys.modules.get("arcpy")
+        sys.modules["arcpy"] = stub_module
+        try:
+            loaded = _load_arcpy()
+        finally:
+            sys.modules.pop("arcpy", None)
+            sys.modules.update({"arcpy": real_arcpy} if real_arcpy else {})
+        check(loaded is stub_module,
+              "the lazy arcpy import returns whatever module the interpreter resolves")
+
+        # ---- running the worker as a child process
+        crash = os.path.join(workdir, "crash_worker.py")
+        # The secret is joined at run time so the script file never holds it.
+        _write(crash, b"import sys\nsys.stderr.write('boom S3cret' + 'Pw\\n')\nsys.exit(3)\n")
+        results, problem = run_sde_worker(
+            sys.executable, crash, {"passwords": {"u": secret}, "files": []})
+        check(results == {} and "exited 3" in problem and secret not in problem
+              and "***" in problem,
+              "a worker that dies is reported with its exit code and the password scrubbed  <-- pinned defect")
+        noisy = os.path.join(workdir, "noisy_worker.py")
+        _write(noisy, (
+            "import json\nprint('banner from a driver')\n"
+            "print('STALEHOST-RESULT {not json')\n"
+            "print('STALEHOST-RESULT ' + json.dumps({'path': 'p1', "
+            "'status': 'declined', 'detail': 'd'}))\n").encode("ascii"))
+        results, problem = run_sde_worker(
+            sys.executable, noisy, {"passwords": {}, "files": ["p1"]})
+        check(results == {"p1": ("declined", "d")} and problem == "",
+              "output that is not a result line is ignored, and so is a result line that is not JSON")
+        results, problem = run_sde_worker(
+            os.path.join(workdir, "no-such-python.exe"), script,
+            {"passwords": {secret: secret}, "files": []})
+        check(results == {} and problem != "" and secret not in problem,
+              "a Python that will not start is reported, not raised")
+
+        silent = os.path.join(workdir, "silent_worker.py")
+        _write(silent, b"pass\n")
+        small = os.path.join(workdir, "small.sde")
+        stub_sde(small, **osa)
+        rows = repoint_sde([small], host, new, True, {}, sys.executable, 0,
+                           silent)
+        check(rows[0]["status"] == "failed"
+              and "no result" in rows[0]["detail"],
+              "a file the worker never answered for is a failure, not a success")
+        marker = os.path.join(workdir, "child_ran.txt")
+        marker_script = os.path.join(workdir, "marker_worker.py")
+        _write(marker_script, ("open(%r, 'w').close()\n" % marker).encode("ascii"))
+        rows = repoint_sde([small], host, new, False, {}, sys.executable, 0,
+                           marker_script)
+        check(rows[0]["status"] == "would" and not os.path.exists(marker),
+              "a plan never starts the ArcGIS Pro Python  <-- pinned defect")
+        run_sde_worker(sys.executable, marker_script,
+                       {"passwords": {}, "files": []})
+        check(os.path.exists(marker),
+              "and the marker script does write when it is started, so that case could fail")
+        hang = os.path.join(workdir, "hang.sde")
+        stub_sde(hang, **dict(osa, behaviour="hang"))
+        original = read_bytes(hang)
+        rows = repoint_sde([hang], host, new, True, {}, sys.executable, 0,
+                           script, timeout=1)
+        check(rows[0]["status"] == "failed"
+              and "did not finish" in rows[0]["detail"]
+              and read_bytes(hang) == original,
+              "a worker that hangs on a dead database is killed and counted, and the file is untouched  <-- pinned defect")
+
+        # ---- a whole tree, end to end, through main()
+        pw_stdin = lambda: io.TextIOWrapper(io.BytesIO(
+            json.dumps({"SDE_USER": secret}).encode("utf-8")))
+
+        def build_apply_tree(name):
+            root = os.path.join(workdir, name)
+            os.makedirs(os.path.join(root, "projects"))
+            for source, leaf in ((stale_aprx, "Zoning.aprx"),
+                                 (stale_lyrx, "Parcels.lyrx"),
+                                 (wide_lyrx, "Wide.lyrx"),
+                                 (zipped_lyrx, "Zipped.lyrx"),
+                                 (clean_lyrx, "Roads.lyrx"),
+                                 (decoy_lyrx, "Decoy.lyrx")):
+                shutil.copy(source, os.path.join(root, "projects", leaf))
+            shutil.copy(stale_py, os.path.join(root, "nightly.py"))
+            for leaf, properties in (
+                    ("os", osa), ("db", dbms),
+                    ("nopw", dict(dbms, user="other_user")),
+                    ("elsewhere", dict(osa, instance="OTHERHOST-9",
+                                       note="was OLDHOST-1")),
+                    ("raises", dict(dbms, behaviour="raise")),
+                    ("noout", dict(osa, behaviour="noout")),
+                    ("stale", dict(osa, behaviour="stale"))):
+                stub_sde(os.path.join(root, leaf + ".sde"), **properties)
+            return root
+
+        apply_root = build_apply_tree("apply_tree")
+        before_state = snapshot(apply_root)
+        common = [host, "--path", apply_root, "--to", new, "--pro-python",
+                  sys.executable]
+        code, out = run(common + ["--json"])
+        plan = json.loads(out)
+        check(snapshot(apply_root) == before_state,
+              "without --apply nothing on disk changes, not one byte and not one new file  <-- pinned defect")
+        check(plan["repoint"]["apply"] is False and code == 1
+              and plan["repoint"]["counts"]["would"] == 11
+              and plan["state"] == "STALE",
+              "the plan covers the 4 project files and the 7 connections and exits with the scan verdict")
+        check(not any(r["path"].endswith("nightly.py")
+                      for r in plan["repoint"]["results"]),
+              "a script that names the host is left alone, not rewritten")
+        code, out = run(common)
+        check("  repoint to=NEWHOST mode=plan " in out
+              and "  would ... 6 more" in out and out.count("\n  would ") == 6,
+              "the text plan caps its rows per status and says how many more")
+        code, out = run(common[:-1] + [os.path.join(workdir, "no-such-python.exe"),
+                                       "--json"])
+        counts = json.loads(out)["repoint"]["counts"]
+        check(counts["would"] == 4 and counts["left"] == 7,
+              "with no ArcGIS Pro Python the connections are left, and the projects are still planned")
+
+        code, out = run(common + ["--apply", "--passwords-stdin", "--json"],
+                        stdin=pw_stdin())
+        report = json.loads(out)
+        check(report["repoint"]["counts"]
+              == {"failed": 3, "fixed": 6, "would": 0, "declined": 1,
+                  "needs-password": 1, "left": 0},
+              "the apply run fixes 4 projects and 2 connections, declines 1, and reports 3 failures and 1 missing password")
+        check(report["state"] == "TEXTONLY" and report["fixable"] == 0
+              and code == 0,
+              "the verdict is read again after the rewrite: no stale project is left")
+        everything = snapshot(workdir)
+        check(not any(secret.encode("ascii") in data
+                      for data in everything.values())
+              and secret not in out,
+              "the password is in no file the run wrote and not in its output  <-- pinned defect")
+        check(any(r["path"].endswith("raises.sde") and "***" in r["detail"]
+                  for r in report["repoint"]["results"]),
+              "and the error that quoted it came back scrubbed")
+        written = [p for p in snapshot(apply_root)]
+        check(len([p for p in written if BACKUP_MARK in p]) == 6
+              and not [p for p in written if p.endswith(TEMP_MARK)
+                       or p.endswith("-stalehost-tmp.sde")],
+              "six backups were taken, one per file fixed, and no temp file is left behind")
+        os_sde = read_bytes(os.path.join(apply_root, "os.sde"))
+        db_sde = read_bytes(os.path.join(apply_root, "db.sde"))
+        check(b"instance=NEWHOST\\SQLEXPRESS" in os_sde
+              and b"password_len=8" in db_sde and b"user=sde_user" in db_sde,
+              "the rebuilt connections name the new host, and the password reached the driver")
+        check(all(read_bytes(os.path.join(apply_root, leaf + ".sde"))
+                  == before_state[os.path.join(apply_root, leaf + ".sde")]
+                  for leaf in ("nopw", "elsewhere", "raises", "noout", "stale")),
+              "every connection that was declined or failed is byte for byte what it was")
+        once = len([p for p in snapshot(apply_root) if BACKUP_MARK in p])
+        code, out = run(common + ["--apply", "--passwords-stdin", "--json",
+                                  "--fail-on-sde"], stdin=pw_stdin())
+        again = json.loads(out)
+        check(again["repoint"]["counts"]["fixed"] == 0
+              and len([p for p in snapshot(apply_root) if BACKUP_MARK in p])
+              == once,
+              "a second run fixes nothing and takes no new backup  <-- pinned defect")
+        check(code == 1 and again["state"] == "STALE",
+              "--fail-on-sde makes the connections that could not be rebuilt exit 1")
+
+        no_pw_root = build_apply_tree("no_password_tree")
+        os.environ["SDE_USER_PW"] = secret
+        os.environ["SDE_USER_PASSWORD"] = secret
+        try:
+            code, out = run([host, "--path", no_pw_root, "--to", new,
+                             "--pro-python", sys.executable, "--apply",
+                             "--json"])
+        finally:
+            del os.environ["SDE_USER_PW"]
+            del os.environ["SDE_USER_PASSWORD"]
+        counts = json.loads(out)["repoint"]["counts"]
+        check(counts["needs-password"] == 3 and counts["failed"] == 2
+              and secret not in out,
+              "a password in the environment is ignored: the logins still wait for stdin  <-- pinned defect")
+
+        squat_root = os.path.join(workdir, "squat_tree")
+        os.makedirs(squat_root)
+        squat = os.path.join(squat_root, "Parcels.lyrx")
+        shutil.copy(stale_lyrx, squat)
+        os.makedirs(squat + TEMP_MARK)
+        code, out = run([host, "--path", squat_root, "--to", new, "--apply"])
+        check(code == 1 and out.startswith("STALE ") and "failed=1" in out
+              and read_bytes(squat) == read_bytes(stale_lyrx),
+              "a project that could not be rewritten keeps the run at exit 1 and is left intact")
+
+        # ---- usage errors
+        class Terminal(object):
+            def isatty(self):
+                return True
+
+        raises(lambda: read_stdin(Terminal()),
+               "a terminal is refused, never prompted for a password")
+        check(read_stdin(io.BytesIO(b"abc")) == b"abc",
+              "a pipe is read whole")
+        raises(lambda: read_stdin(io.BytesIO(b"x" * 1048577)),
+               "a pipe over one megabyte is refused")
+        code, out = run([host, "--apply"])
+        check(code == 64, "--apply without --to is a usage error, exit 64")
+        code, out = run([host, "--passwords-stdin"])
+        check(code == 64, "--passwords-stdin without --to is a usage error")
+        unread = pw_stdin()
+        code, out = run([host, "--to", new, "--passwords-stdin", "--path", tree],
+                        stdin=unread)
+        check(code == 64 and unread.buffer.tell() == 0,
+              "--passwords-stdin without --apply is a usage error, and stdin is not read  <-- pinned defect")
+        code, out = run([host, "--to", "OLDHOST-1.example.org", "--path", tree])
+        check(code == 64 and "token" in out,
+              "a replacement that still names the old host is a usage error")
+        code, out = run([host, "--to", new, "--apply", "--passwords-stdin",
+                         "--path", tree], stdin=io.TextIOWrapper(
+                             io.BytesIO(b"{not json TOPSECRET")))
+        check(code == 64 and "TOPSECRET" not in out,
+              "unreadable stdin is a usage error that does not echo it")
+        code, out = run([host, "--to", new, "--apply", "--passwords-stdin",
+                         "--path", tree], stdin=Terminal())
+        check(code == 64, "a terminal on stdin is a usage error")
+        code, out = run([host, "--path", os.path.join(workdir, "missing-" + secret),
+                         "--to", new, "--apply", "--passwords-stdin"],
+                        stdin=pw_stdin())
+        check(code == 1 and out.startswith("ERROR ") and secret not in out
+              and "***" in out,
+              "an error line never carries a password, even one inside the message  <-- pinned defect")
+
+        # ---- the pieces that need a platform
+        def no_winreg():
+            raise ImportError("no winreg here")
+
+        def no_ctypes():
+            raise ImportError("no ctypes here")
+
+        check(_pro_in_registry(importer=no_winreg) is False,
+              "a host with no winreg module reports no Pro and does not raise")
+        check(_windows_drive_type("C:\\", importer=no_ctypes) == 0,
+              "a host with no ctypes reports an unknown drive type")
+
+        # ---- the harness itself, run against cases that are meant to fail
+        meta_out = io.StringIO()
+        meta_check, meta_raises, meta_finish = _harness(meta_out)
+
+        def wrong_error():
+            raise KeyError("x")
+
+        meta_check(True, "kept")
+        meta_check(False, "dropped")
+        meta_raises(wrong_error, "wrong error")
+        meta_raises(lambda: None, "no error")
+        meta_raises(lambda: host_needles(""), "right error")
+        meta_code = meta_finish()
+        check(meta_code == 1 and "5 assertions, 3 failed" in meta_out.getvalue()
+              and "  FAILED: dropped" in meta_out.getvalue()
+              and "FAIL  no error (no error raised)" in meta_out.getvalue(),
+              "the harness counts a failure, names it, and returns exit 1  <-- pinned defect")
+        meta_out = io.StringIO()
+        meta_check, meta_raises, meta_finish = _harness(meta_out)
+        meta_check(True, "kept")
+        check(meta_finish() == 0 and "1 assertions, 0 failed" in meta_out.getvalue(),
+              "and a clean run returns exit 0 with the footer the README quotes")
+
         # ---- argument handling
         args = _parse([host])
         check(args.old_server == host, "the old host name is read")
@@ -1446,29 +2693,47 @@ def self_test():
         check(_parse(["--self-test"]).self_test, "--self-test parses")
         # A unique prefix of a real flag is refused, not read as that flag.
         # With abbreviations on, --fail-on-t was taken for --fail-on-text.
-        saved_err = sys.stderr
-        sys.stderr = io.StringIO()
-        try:
-            _parse([host, "--fail-on-t"])
-            refused = False
-        except SystemExit:
-            refused = True
-        finally:
-            sys.stderr = saved_err
-        check(refused, "a unique prefix of --fail-on-text is refused by "
+        def parse_refused(argv):
+            saved_err = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                _parse(argv)
+            except SystemExit:
+                return True
+            finally:
+                sys.stderr = saved_err
+            return False
+
+        check(parse_refused([host, "--fail-on-t"]),
+              "a unique prefix of --fail-on-text is refused by "
               "the parser  <-- pinned defect")
+        check(not parse_refused([host]), "an ordinary command line is read")
+        check(args.to is None and args.apply is False
+              and args.passwords_stdin is False,
+              "--to, --apply and --passwords-stdin default to OFF")
+        check(args.pro_python == "C:\\Program Files\\ArcGIS\\Pro\\bin\\Python"
+              "\\envs\\arcgispro-py3\\python.exe",
+              "--pro-python defaults to the Python that ships with Pro")
+        wanted = _parse([host, "--to", "NEWHOST", "--apply",
+                         "--passwords-stdin", "--pro-python", "P"])
+        check(wanted.to == "NEWHOST" and wanted.apply and wanted.passwords_stdin
+              and wanted.pro_python == "P",
+              "--to, --apply, --passwords-stdin and --pro-python are read")
+        check(parse_refused([host, "--to", "NEWHOST", "--ap"]),
+              "a unique prefix of --apply is refused by the parser, so --ap cannot write  <-- pinned defect")
+        check(parse_refused([host, "--passwords"]),
+              "a unique prefix of --passwords-stdin is refused by the parser  <-- pinned defect")
+        check(parse_refused([host, "--password", "x"]),
+              "there is no flag that takes a password  <-- pinned defect")
+        check(parse_refused([host, "--pro", "P"]),
+              "a unique prefix of --pro-python is refused by the parser")
+        check(_parse(["--sde-worker", "--apply"]).sde_worker,
+              "the internal worker flag parses")
     finally:
+        WORKER_SCRIPT = saved_script
         shutil.rmtree(workdir, ignore_errors=True)
 
-    print("-" * 70)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    return finish()
 
 
 # ----------------------------------------------------------------------- cli
@@ -1480,9 +2745,12 @@ def _parse(argv):
         description="Find every ArcGIS file on this device that still names the "
                     "host you are retiring, and never call a tree clean that "
                     "could not be finished.",
-        epilog="stalehost never writes a file, never opens a database "
-               "connection and never reaches the network. Exit 1 means stale "
-               "content, or a scan that could not be trusted.",
+        epilog="Without --apply stalehost writes nothing, opens no database "
+               "connection and never reaches the network. With --to and "
+               "--apply it rewrites .aprx and .lyrx files in place and "
+               "rebuilds .sde connections through ArcGIS Pro's Python, each "
+               "after a backup. Exit 1 means stale content, or a scan that "
+               "could not be trusted.",
     )
     parser.add_argument("old_server", nargs="?",
                         help="the host name being retired, matched as a whole "
@@ -1515,13 +2783,84 @@ def _parse(argv):
                              "thousands of scratch .sde connections")
     parser.add_argument("--json", action="store_true",
                         help="emit the result as JSON instead of the text line")
+    parser.add_argument("--to", dest="to", default=None, metavar="NEWHOST",
+                        help="the host that replaces the old one. On its own "
+                             "this prints the plan and writes nothing.")
+    parser.add_argument("--apply", action="store_true",
+                        help="with --to, rewrite the files. This is the only "
+                             "flag that writes.")
+    parser.add_argument("--passwords-stdin", dest="passwords_stdin",
+                        action="store_true",
+                        help="with --apply, read one JSON object of database "
+                             "login to password from stdin, for the .sde "
+                             "connections that store a login. There is no "
+                             "flag or environment variable for a password.")
+    parser.add_argument("--pro-python", dest="pro_python", default=PRO_PYTHON,
+                        metavar="PATH",
+                        help="the ArcGIS Pro python.exe that rebuilds .sde "
+                             "connections (default: %s)" % PRO_PYTHON)
+    parser.add_argument("--sde-worker", dest="sde_worker", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--self-test", dest="self_test", action="store_true",
                         help="run the offline assertions and exit")
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def _remediation_args(args, stdin):
+    """Validate --to, --apply and --passwords-stdin. Return (new host, passwords).
+
+    Raises ValueError for any combination that would write without a target, or
+    read a password it will not use.
+    """
+    if args.to is None:
+        if args.apply or args.passwords_stdin:
+            raise ValueError("--apply and --passwords-stdin need --to")
+        return None, {}
+    new = check_new_host(args.to, args.old_server)
+    if args.passwords_stdin and not args.apply:
+        raise ValueError("--passwords-stdin needs --apply")
+    if not args.passwords_stdin:
+        return new, {}
+    return new, parse_passwords(read_stdin(stdin))
+
+
+def _worker_main(args, stdin, loader):
+    """The hidden --sde-worker mode. It writes, so it needs --apply like the rest."""
+    if not args.apply:
+        print("error: --sde-worker is internal and needs --apply",
+              file=sys.stderr)
+        return 64
+    job = json.loads(getattr(stdin, "buffer", stdin).read().decode("utf-8"))
+    return sde_worker(job, loader, sys.stdout)
+
+
+ROW_ORDER = ("failed", "fixed", "would", "declined", "needs-password", "left")
+
+
+def repoint_counts(rows):
+    return dict((status, len([r for r in rows if r["status"] == status]))
+                for status in ROW_ORDER)
+
+
+def repoint_lines(new, apply, rows):
+    """The repoint report: one totals line, then rows capped per status."""
+    counts = repoint_counts(rows)
+    lines = ["  repoint to=%s mode=%s %s" % (
+        new, "apply" if apply else "plan",
+        " ".join("%s=%d" % (status, counts[status]) for status in ROW_ORDER))]
+    for status in ROW_ORDER:
+        chosen = [r for r in rows if r["status"] == status]
+        for row in chosen[:SAMPLE_CAP]:
+            lines.append("  %s %s -- %s" % (status, format_sample(row["path"]),
+                                            row["detail"]))
+        if len(chosen) > SAMPLE_CAP:
+            lines.append("  %s ... %d more" % (status, len(chosen) - SAMPLE_CAP))
+    return lines
+
+
+def main(argv=None, stdin=None, arcpy_loader=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
+    stdin = sys.stdin if stdin is None else stdin
 
     # A project path can hold characters the console codepage cannot encode.
     # With a cp1252 stdout, which is what a scheduled task on Windows gets, one
@@ -1534,6 +2873,9 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
+
+    if args.sde_worker:
+        return _worker_main(args, stdin, arcpy_loader or _load_arcpy)
 
     try:
         host_needles(args.old_server)
@@ -1551,23 +2893,45 @@ def main(argv=None):
 
     host = args.old_server.strip()
     try:
+        new, passwords = _remediation_args(args, stdin)
+    except ValueError as exc:
+        print("error: %s." % exc, file=sys.stderr)
+        return 64
+
+    rows = None
+    try:
         roots = scan_roots(args.path)
+        hits = [] if new else None
         walk = scan_tree(roots, host, max_seconds=args.max_seconds,
-                         include_temp=args.scan_temp, text_exts=text_exts)
+                         include_temp=args.scan_temp, text_exts=text_exts,
+                         hits=hits)
+        if new:
+            rows = repoint_all(hits, host, new, args.apply, passwords,
+                               args.pro_python, time.time(), WORKER_SCRIPT)
+        if new and args.apply:
+            # The verdict is the one for the tree as it stands now, so a file
+            # that could not be repointed still says STALE, and a repointed one
+            # is read again by the same matcher before it is called clean.
+            walk = scan_tree(roots, host, max_seconds=args.max_seconds,
+                             include_temp=args.scan_temp, text_exts=text_exts)
     except Exception as exc:
         # Everything is caught here on purpose. A traceback on stderr and a
         # non-zero exit that means nothing in particular is how an unverified
         # device gets read as a broken script and then ignored. Fail toward
         # remediation with a line the grid can show.
-        print("%s STALEHOST %s" % (ERROR, exc))
+        print("%s STALEHOST %s" % (ERROR, scrub(str(exc), passwords.values())))
         return 1
 
     state, code = verdict(walk, args.fail_on_sde, args.fail_on_text)
     pro = "yes" if pro_installed() else "no"
 
     if args.json:
-        print(json.dumps(walk.to_dict(state, code, host, pro, text_exts),
-                         indent=2))
+        report = walk.to_dict(state, code, host, pro, text_exts)
+        if rows is not None:
+            report["repoint"] = {"to": new, "apply": args.apply,
+                                 "counts": repoint_counts(rows),
+                                 "results": rows}
+        print(json.dumps(report, indent=2))
         return code
 
     print(summary_line(state, host, walk, pro, text_exts))
@@ -1580,8 +2944,13 @@ def main(argv=None):
         print("  txt %s" % format_sample(path))
     for path in walk.sde_samples:
         print("  sde %s" % format_sample(path))
+    if rows is not None:
+        for line in repoint_lines(new, args.apply, rows):
+            print(line)
     return code
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no branch
+    # shortcut: the false branch needs an import, and this file is only ever
+    # measured by running it, so coverage cannot reach it.
     sys.exit(main())
