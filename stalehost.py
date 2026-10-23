@@ -542,7 +542,16 @@ def parse_passwords(data):
             isinstance(value, str) and value for value in loaded.values()):
         raise ValueError("stdin must be one JSON object mapping each login to "
                          "a non-empty password string")
-    return dict((key.lower(), value) for key, value in loaded.items())
+    # Logins match without regard to case, so two keys that differ only in case
+    # name one login. Two different passwords for it cannot both be right, and
+    # last-one-wins would pick one without saying so.
+    result = {}
+    for key, value in loaded.items():
+        if result.get(key.lower(), value) != value:
+            raise ValueError("stdin gives one login two different passwords "
+                             "under names that differ only in case")
+        result[key.lower()] = value
+    return result
 
 
 def sde_decision(props, host, new, passwords):
@@ -998,15 +1007,77 @@ def verify_rewrite(temp, extension, host, new):
         raise ValueError("the rewritten file does not name the new host")
 
 
+# Win32 constants for the access list copy. SE_FILE_OBJECT names the kind of
+# object, the others pick the part of the security descriptor and say whether the
+# list blocks inheritance from the folder.
+SE_FILE_OBJECT = 1
+DACL_SECURITY_INFORMATION = 0x4
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
+SE_DACL_PROTECTED = 0x1000
+
+
+def copy_acl(source, target, importer=_import_ctypes):
+    """Give target the access list that source has. Return True when it was copied.
+
+    A new file takes the access list its folder hands down. A project or an .sde
+    that someone locked to one account would come back readable by every account
+    the folder trusts, and an .sde holds a stored password. So the rewritten file
+    and its backup get the original's list, including whether it blocks
+    inheritance. Off Windows the mode bits are the whole story, and
+    shutil.copymode has already copied them, so this does nothing there. A volume
+    with no access list, such as FAT, has nothing to copy. A failure raises, and
+    the caller leaves the original as it was.
+    """
+    try:
+        ctypes = importer()
+        advapi = ctypes.windll.advapi32
+        kernel = ctypes.windll.kernel32
+    except (ImportError, AttributeError):
+        return False
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    code = advapi.GetNamedSecurityInfoW(
+        source, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None,
+        ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    if code:
+        raise OSError("cannot read the access list of the file (error %d)"
+                      % code)
+    try:
+        if not dacl.value:
+            return False
+        control = ctypes.c_ushort()
+        revision = ctypes.c_ulong()
+        if not advapi.GetSecurityDescriptorControl(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)):
+            raise OSError("cannot read the access list flags of the file")
+        if control.value & SE_DACL_PROTECTED:
+            flag = PROTECTED_DACL_SECURITY_INFORMATION
+        else:
+            flag = UNPROTECTED_DACL_SECURITY_INFORMATION
+        code = advapi.SetNamedSecurityInfoW(
+            target, SE_FILE_OBJECT,
+            ctypes.c_ulong(DACL_SECURITY_INFORMATION | flag),
+            None, None, dacl, None)
+        if code:
+            raise OSError("cannot set the access list of the new file "
+                          "(error %d)" % code)
+    finally:
+        kernel.LocalFree(descriptor)
+    return True
+
+
 def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
-            before_swap=None):
+            before_swap=None, acl=copy_acl):
     """Back up path, then put staged in its place. Return the backup path.
 
     The order is the safety. The original is compared with the stat taken before
     the work began, so a file someone saved in the meantime is refused and not
     overwritten. The backup is compared byte for byte before anything is
-    replaced. If the rename itself fails, as it does when another process holds
-    the file open, the backup is removed again because nothing changed.
+    replaced. Both the backup and the new file take the original's mode and
+    access list. If any step after the backup fails, as the rename does when
+    another process holds the file open, the backup is removed again because
+    nothing changed.
     """
     if before_swap is not None:
         before_swap()
@@ -1015,11 +1086,12 @@ def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
         raise ValueError("the file changed while it was being rewritten")
     backup = backup_path(path, now)
     copy(path, backup)
-    if not filecmp.cmp(path, backup, shallow=False):
-        os.remove(backup)
-        raise ValueError("the backup does not match the original")
-    shutil.copymode(path, staged)
     try:
+        if not filecmp.cmp(path, backup, shallow=False):
+            raise ValueError("the backup does not match the original")
+        shutil.copymode(path, staged)
+        acl(path, backup)
+        acl(path, staged)
         replace(staged, path)
     except Exception:
         os.remove(backup)
@@ -1028,7 +1100,7 @@ def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
 
 
 def repoint_file(path, extension, host, new, now, replace=os.replace,
-                 copy=shutil.copy2, before_swap=None):
+                 copy=shutil.copy2, before_swap=None, acl=copy_acl):
     """Rewrite one .aprx or .lyrx in place. Return (count, backup path).
 
     The new content is built beside the original and checked before anything
@@ -1041,7 +1113,8 @@ def repoint_file(path, extension, host, new, now, replace=os.replace,
         if not count:
             raise ValueError("no whole-token match to rewrite")
         verify_rewrite(temp, extension, host, new)
-        backup = swap_in(path, temp, before, now, replace, copy, before_swap)
+        backup = swap_in(path, temp, before, now, replace, copy, before_swap,
+                          acl)
     finally:
         if os.path.isfile(temp):
             os.remove(temp)
@@ -1209,8 +1282,10 @@ def repoint_all(hits, host, new, apply, passwords, python, now, script):
 
 def read_stdin(stdin):
     """Read the password JSON from a pipe. A terminal is refused, never prompted."""
-    if stdin.isatty():
-        raise ValueError("--passwords-stdin reads a pipe, not a terminal")
+    # A process started with no stdin at all has sys.stdin set to None.
+    if stdin is None or stdin.isatty():
+        raise ValueError("--passwords-stdin reads a pipe, not a terminal and "
+                         "not a closed stdin")
     data = getattr(stdin, "buffer", stdin).read(STDIN_CAP + 1)
     if len(data) > STDIN_CAP:
         raise ValueError("stdin is over the %d byte cap" % STDIN_CAP)
@@ -2112,8 +2187,12 @@ def self_test():
         check(parse_passwords(b'\xef\xbb\xbf{"SDE_User": "pw1", "Other": "p w2"}')
               == {"sde_user": "pw1", "other": "p w2"},
               "logins are matched without regard to case, and a BOM is tolerated")
+        check(parse_passwords(b'{"Sa": "same", "sa": "same"}') == {"sa": "same"},
+              "one login in two cases with the same password is one login")
         for label, data in (
                 ("not JSON", b"not json at all TOPSECRET"),
+                ("one login twice with different passwords",
+                 b'{"Sa": "TOPSECRET", "sa": "TOPSECRET2"}'),
                 ("a list", b'["TOPSECRET"]'),
                 ("a number for a password", b'{"u": 5, "m": "TOPSECRET"}'),
                 ("an empty password", b'{"u": ""}'),
@@ -2307,6 +2386,113 @@ def self_test():
         check(isinstance(problem, ValueError) and read_bytes(target) == original
               and not backups_of("badcopy.lyrx"),
               "a backup that does not match the original stops the swap  <-- pinned defect")
+
+        # ---- the access list. A new file takes its folder's list unless told
+        # otherwise, which widened a locked project. The stand-in below plays
+        # the Win32 calls, so the same cases run on every host.
+        class _Pointer(object):
+            def __init__(self):
+                self.value = None
+
+        class _Win32(object):
+            """Records the calls and returns the codes it was told to."""
+
+            def __init__(self, dacl=1, read=0, flags=0, write=0, ok=1):
+                self.dacl, self.read, self.flags = dacl, read, flags
+                self.write, self.ok = write, ok
+                self.calls = []
+                self.freed = []
+                self.c_void_p = _Pointer
+                self.c_ushort = _Pointer
+                self.c_ulong = lambda value=0: value
+                self.byref = lambda holder: holder
+                self.windll = types.SimpleNamespace(
+                    advapi32=types.SimpleNamespace(
+                        GetNamedSecurityInfoW=self.get_info,
+                        GetSecurityDescriptorControl=self.get_control,
+                        SetNamedSecurityInfoW=self.set_info),
+                    kernel32=types.SimpleNamespace(LocalFree=self.freed.append))
+
+            def get_info(self, path, kind, part, owner, group, dacl, sacl, sd):
+                self.calls.append(("get", path))
+                dacl.value = self.dacl
+                sd.value = 99
+                return self.read
+
+            def get_control(self, descriptor, control, revision):
+                control.value = self.flags
+                return self.ok
+
+            def set_info(self, path, kind, part, owner, group, dacl, sacl):
+                self.calls.append(("set", path, part, dacl.value))
+                return self.write
+
+        fake = _Win32(flags=SE_DACL_PROTECTED)
+        check(copy_acl("a", "b", importer=lambda: fake) is True
+              and fake.calls[1] == ("set", "b", DACL_SECURITY_INFORMATION
+                                    | PROTECTED_DACL_SECURITY_INFORMATION, 1)
+              and len(fake.freed) == 1,
+              "a list that blocks inheritance is copied as one that blocks it  <-- pinned defect")
+        fake = _Win32()
+        copy_acl("a", "b", importer=lambda: fake)
+        check(fake.calls[1][2] == DACL_SECURITY_INFORMATION
+              | UNPROTECTED_DACL_SECURITY_INFORMATION,
+              "a list that inherits is copied as one that inherits")
+        fake = _Win32(dacl=0)
+        check(copy_acl("a", "b", importer=lambda: fake) is False
+              and len(fake.calls) == 1 and len(fake.freed) == 1,
+              "a volume with no access list is left alone, never given an empty one")
+        for label, broken in (("read", _Win32(read=5)),
+                              ("flag", _Win32(ok=0)),
+                              ("set", _Win32(write=5))):
+            problem = outcome(lambda w=broken: copy_acl(
+                "a", "b", importer=lambda: w))
+            check(isinstance(problem, OSError) and len(broken.freed) == (
+                0 if label == "read" else 1),
+                  "a failed access list %s raises, and a descriptor that was handed out is freed  <-- pinned defect"
+                  % label)
+
+        def no_ctypes():
+            raise ImportError("no ctypes")
+
+        check(copy_acl("a", "b", importer=no_ctypes) is False
+              and copy_acl("a", "b", importer=lambda: types.SimpleNamespace())
+              is False,
+              "off Windows there is no access list to copy and nothing happens")
+
+        def refusing_acl(source, destination):
+            raise OSError(5, "access denied")
+
+        target = stale_copy(stale_lyrx, "acl_fail.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               acl=refusing_acl))
+        check(isinstance(problem, OSError) and read_bytes(target) == original
+              and not os.path.exists(target + TEMP_MARK)
+              and not backups_of("acl_fail.lyrx"),
+              "a file whose access list cannot be copied is left as it was, with no backup  <-- pinned defect")
+
+        def listing(path):
+            """The access list as icacls prints it, minus the file name."""
+            text = subprocess.check_output(["icacls", path]).decode("mbcs")
+            return sorted(line.split(path)[-1].strip()
+                          for line in text.splitlines()[:-2] if line.strip())
+
+        real_acl_ok = True
+        if sys.platform == "win32":
+            locked = stale_copy(stale_lyrx, "locked_down.lyrx")
+            subprocess.check_call(["icacls", locked, "/inheritance:r"],
+                                  stdout=subprocess.PIPE)
+            me = os.environ["USERNAME"]
+            subprocess.check_call(["icacls", locked, "/grant:r", me + ":(F)"],
+                                  stdout=subprocess.PIPE)
+            before_list = listing(locked)
+            count, kept = repoint_file(locked, ".lyrx", host, new, 0)
+            real_acl_ok = (len(before_list) == 1
+                           and listing(locked) == before_list
+                           and listing(kept) == before_list)
+        check(real_acl_ok,
+              "a project locked to one account is still locked after the rewrite, and so is its backup (read from icacls on Windows)  <-- pinned defect")
         raises(lambda: verify_rewrite(stale_lyrx, ".lyrx", host, new),
                "a rewrite that still names the old host is refused")
         raises(lambda: verify_rewrite(decoy_lyrx, ".lyrx", host, new),
@@ -2599,6 +2785,17 @@ def self_test():
 
         raises(lambda: read_stdin(Terminal()),
                "a terminal is refused, never prompted for a password")
+        raises(lambda: read_stdin(None),
+               "a closed stdin is refused, not a traceback  <-- pinned defect")
+        saved_stdin = sys.stdin
+        sys.stdin = None
+        try:
+            code, out = run([host, "--path", tree, "--to", new, "--apply",
+                             "--passwords-stdin"])
+        finally:
+            sys.stdin = saved_stdin
+        check(code == 64 and "Traceback" not in out and "closed stdin" in out,
+              "a run with no stdin at all exits 64 with one line  <-- pinned defect")
         check(read_stdin(io.BytesIO(b"abc")) == b"abc",
               "a pipe is read whole")
         raises(lambda: read_stdin(io.BytesIO(b"x" * 1048577)),

@@ -48,13 +48,93 @@ file. Esri's documentation does not say how an `.aprx` is stored, so that part r
 are. See [Limits](#limits). For an `.sde` it does not edit bytes. It asks ArcGIS Pro's own Python to
 rebuild the connection.
 
+A search of GitHub for `stalehost`, `updateConnectionProperties`, `aprx repoint` and `sde repoint`
+found no other tool with this scope. That is a weak claim, because a repository search is not a
+code search, and it is not a reason to think none exists.
+
 A recursive text search is the other alternative. It reads the bytes of the container, and for an
 `.aprx` those bytes do not contain the host name. A self-test case pins that.
 
 ```
 $ python stalehost.py --self-test
-@@SELFTEST@@
+stalehost self-test: stand-in arcpy, no network, no registry write
+----------------------------------------------------------------------
+...
+PASS  a non-ASCII host name is refused rather than never matching
+...
+PASS  the neighbouring server OLDHOST-10 is not a hit  <-- pinned defect
+...
+PASS  a utf-16-le host at an odd byte offset is still a hit  <-- pinned defect
+...
+PASS  a zipped .lyrx is routed by its PK header, not its extension  <-- pinned defect
+...
+PASS  the raw .aprx bytes do not contain the host name  <-- pinned defect
+...
+PASS  an .aprx that will not open is counted unreadable, not clean  <-- pinned defect
+...
+PASS  a replacement host is stripped and kept as typed
+...
+PASS  a backslash in the replacement is refused, because it would corrupt JSON  <-- pinned defect
+...
+PASS  a replacement that still names the old host is refused, or a rerun would grow it  <-- pinned defect
+...
+PASS  a utf-16-le host is replaced and stays utf-16-le  <-- pinned defect
+...
+PASS  two overlapping matches are not both cut, which would shred the bytes  <-- pinned defect
+...
+PASS  a backup name that is taken is numbered, never overwritten  <-- pinned defect
+...
+PASS  a password that holds another is removed whole, longest first  <-- pinned defect
+...
+PASS  stdin that is not JSON is refused without echoing it  <-- pinned defect
+PASS  stdin that is one login twice with different passwords is refused without echoing it  <-- pinned defect
+...
+PASS  a connection to the neighbouring server is declined  <-- pinned defect
+...
+PASS  time stamps, compression and attributes are kept, stored parts included
+...
+PASS  a file already repointed is refused on a rerun and left alone  <-- pinned defect
+...
+PASS  a second backup in the same second is numbered and the first survives  <-- pinned defect
+...
+PASS  a rename that fails leaves the file, the temp file and the backups as they were  <-- pinned defect
+PASS  a file saved while it was being rewritten is not overwritten  <-- pinned defect
+PASS  a backup that does not match the original stops the swap  <-- pinned defect
+PASS  a list that blocks inheritance is copied as one that blocks it  <-- pinned defect
+...
+PASS  a file whose access list cannot be copied is left as it was, with no backup  <-- pinned defect
+PASS  a project locked to one account is still locked after the rewrite, and so is its backup (read from icacls on Windows)  <-- pinned defect
+...
+PASS  an error that quotes the password has it scrubbed before it is printed  <-- pinned defect
+...
+PASS  the worker mode refuses to run without --apply, so nothing writes without it  <-- pinned defect
+...
+PASS  a plan never starts the ArcGIS Pro Python  <-- pinned defect
+...
+PASS  a worker that hangs on a dead database is killed and counted, and the file is untouched  <-- pinned defect
+PASS  without --apply nothing on disk changes, not one byte and not one new file  <-- pinned defect
+...
+PASS  the password is in no file the run wrote and not in its output  <-- pinned defect
+...
+PASS  a second run fixes nothing and takes no new backup  <-- pinned defect
+...
+PASS  a password in the environment is ignored: the logins still wait for stdin  <-- pinned defect
+...
+PASS  a run with no stdin at all exits 64 with one line  <-- pinned defect
+...
+PASS  an error line never carries a password, even one inside the message  <-- pinned defect
+...
+PASS  a unique prefix of --fail-on-text is refused by the parser  <-- pinned defect
+...
+PASS  a unique prefix of --apply is refused by the parser, so --ap cannot write  <-- pinned defect
+...
+PASS  there is no flag that takes a password  <-- pinned defect
+...
+----------------------------------------------------------------------
+309 assertions, 0 failed
 ```
+
+The full run prints all 309 assertions. Each `...` line is where this block is cut.
 
 ## Requirements
 
@@ -65,7 +145,7 @@ ArcGIS Pro's Python, on a plain `python3`, and on a device with no Esri software
 Rebuilding an `.sde` is the one step that needs ArcGIS Pro. The tool starts Pro's `python.exe` as a
 child process for it. Everything else, the scan and the `.aprx` and `.lyrx` rewrite, does not.
 
-`winreg` and `ctypes` are imported inside the two functions that need them, so the tool also runs on
+`winreg` and `ctypes` are imported inside the three functions that need them, so the tool also runs on
 Linux and macOS. There it reports no ArcGIS Pro and needs `--path`.
 
 ```
@@ -238,7 +318,26 @@ process on its stdin and nowhere else, so it is not in any process listing. A te
 refused and the tool does not prompt. Logins are matched without regard to case. Every message that
 comes back from the child, and every error line the tool prints, has each password replaced with
 `***` first. A login that has no password in the object is reported `needs-password`, and its name
-is not printed.
+is not printed. Two keys that differ only in case name one login. If their passwords differ the input
+is refused, because a last-one-wins choice would pick one without saying so.
+
+**Piping the file from Windows PowerShell 5.1 changes the bytes.** PowerShell 5.1 encodes what it
+pipes with `$OutputEncoding`, which is US-ASCII by default. A password with an accented letter
+arrives as `?`, and the connection is rebuilt with the wrong password. Measured on PowerShell
+5.1.26100 piping `{"u": "p<e-acute>w"}`: the child read `p?w`. With
+`$OutputEncoding = New-Object System.Text.UTF8Encoding($false)` set first, or with PowerShell 7.6,
+it read the two UTF-8 bytes. A redirect from a file (`< logins.json`) and `type logins.json` in
+`cmd` do not re-encode. The tool cannot tell a real `?` from a damaged one.
+
+**Permissions.** A new file takes the access list its folder hands down. Run against a project that
+was locked to one account, the first version of this tool produced a file readable by SYSTEM, the
+Administrators group and that account, and its backup the same. An `.sde` holds a stored password, so
+the rewritten file and its backup now take the original's access list, including whether it blocks
+inheritance, through `GetNamedSecurityInfoW` and `SetNamedSecurityInfoW`. If the list cannot be read
+or set, the file is reported `failed`, the backup is removed and the original is untouched. The
+self-test reads the lists back with `icacls` on Windows: one account on the original, and the same
+one account on the new file and on the backup. Off Windows the mode bits are the whole story, and
+`shutil.copymode` has copied them, so the step does nothing.
 
 **The exit code is read after the work.** After `--apply` the tree is scanned again and the exit code
 is the verdict for the tree as it now stands. A project that could not be rewritten still says
@@ -248,7 +347,32 @@ A real run on a small tree, on a Windows machine with ArcGIS Pro 3.6. The `.aprx
 by Pro itself:
 
 ```
-@@RUN@@
+$ python stalehost.py OLDHOST-1 --path . --to NEWHOST
+STALE STALEHOST old=OLDHOST-1 fix=2 (aprx=1 lyrx=1) sde=0 text=0 scanned=3 unreadable=0 elapsed=0s pro=yes textext=py,bat,cmd,ps1,sql,ini
+  hit .\maps\Parcels.lyrx
+  hit .\maps\Project.aprx
+  repoint to=NEWHOST mode=plan failed=0 fixed=0 would=2 declined=0 needs-password=0 left=0
+  would .\maps\Parcels.lyrx -- rewrite in place
+  would .\maps\Project.aprx -- rewrite in place
+(exit 1)
+
+$ python stalehost.py OLDHOST-1 --path . --to NEWHOST --apply
+CLEAN STALEHOST old=OLDHOST-1 fix=0 (aprx=0 lyrx=0) sde=0 text=0 scanned=3 unreadable=0 elapsed=0s pro=yes textext=py,bat,cmd,ps1,sql,ini
+  repoint to=NEWHOST mode=apply failed=0 fixed=2 would=0 declined=0 needs-password=0 left=0
+  fixed .\maps\Parcels.lyrx -- 1 replacement(s)
+  fixed .\maps\Project.aprx -- 1 replacement(s)
+(exit 0)
+
+$ python stalehost.py OLDHOST-1 --path . --to NEWHOST --apply
+CLEAN STALEHOST old=OLDHOST-1 fix=0 (aprx=0 lyrx=0) sde=0 text=0 scanned=3 unreadable=0 elapsed=0s pro=yes textext=py,bat,cmd,ps1,sql,ini
+  repoint to=NEWHOST mode=apply failed=0 fixed=0 would=0 declined=0 needs-password=0 left=0
+(exit 0)
+
+./maps/Neighbour.lyrx
+./maps/Parcels.lyrx
+./maps/Parcels.lyrx.stalehost-bak-20261022T231053Z
+./maps/Project.aprx
+./maps/Project.aprx.stalehost-bak-20261022T231053Z
 ```
 
 The second `--apply` fixed nothing and took no new backup. `Neighbour.lyrx` names `OLDHOST-10`, and
@@ -376,11 +500,25 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
   (`TRANSACTIONAL`), `version`. The page says the output file has the `.sde` extension. It does not
   say whether an existing output is overwritten, so the tool never leaves one to be overwritten.
 - [Workspace properties](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/workspace-properties.html).
-  `connectionProperties` and its `dbClient`, `instance`, `server`, `database`, `authentication_mode`
-  (`OSA` or `DBMS`), `user`, `version`, `branch`, `historical_name` and `historical_timestamp`.
+  `connectionProperties` and its `dbClient` ("for example, `sqlserver`, `db2`, `oracle`, or
+  `postgresql`", which is why the tool compares it without regard to case), `instance`, `server`,
+  `database`, `authentication_mode` (`OSA` or `DBMS`), `user`, `version`, `branch`, `historical_name`
+  and `historical_timestamp`. The page does not say whether a password is returned, and the tool
+  never asks for one: it takes passwords from stdin only.
 - [`ArcGISProject`](https://doc.esri.com/en/arcgis-pro/latest/arcpy/mapping/arcgisproject-class.html).
   `updateConnectionProperties` and its `validate` argument. The page does not say what an `.aprx` is
   on disk.
+- [`GetNamedSecurityInfoW`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getnamedsecurityinfow)
+  and [`SetNamedSecurityInfoW`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow).
+  Both return `ERROR_SUCCESS` on success and a nonzero code otherwise. The first returns a null DACL
+  pointer when the object has none, and its security descriptor must be freed with `LocalFree`. Both
+  list files on NTFS. The tool treats a null DACL as nothing to copy and never sets an empty one.
+- [`GetSecurityDescriptorControl`](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getsecuritydescriptorcontrol)
+  returns nonzero on success. The `SE_DACL_PROTECTED` bit it reports decides which of the two flags
+  on the [`SECURITY_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information)
+  page the copy sets: `PROTECTED_DACL_SECURITY_INFORMATION` ("The DACL cannot inherit access control
+  entries") or `UNPROTECTED_DACL_SECURITY_INFORMATION` ("The DACL inherits ACEs from the parent
+  object").
 - [`os.replace`](https://docs.python.org/3/library/os.html#os.replace). Replaces an existing file, can
   fail across filesystems, and is atomic when it succeeds.
 
@@ -410,6 +548,11 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
   the backups and every failure were run against a stand-in `arcpy`. The real Pro Python was also run
   as the child against real connection files with an unreachable server, and returned the `failed`
   row above. Whether `Describe` returns the `instance` text your connections need was not seen.
+- **The backup of an `.sde` holds the stored credential the original held.** It has the original's
+  access list, but it is still a copy of a secret, and the tool never deletes a backup. Remove the
+  backups once the new connections work.
+- Only the discretionary access list is copied. The owner and the audit list are not, so the owner of
+  a rewritten file is the account that ran the tool. A volume that is not NTFS has no list to copy.
 - Text files are reported and never rewritten. A host name in a script is often a decision and not a
   connection.
 - A branch or historical connection, a connection that is not SQL Server, and a connection whose
@@ -434,14 +577,19 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
 - The elapsed time is whole seconds, and the cap is checked between directories. A single enormous
   directory can overshoot it. The cap applies to each of the two scans in an `--apply` run. The
   Pro child has its own cap of 30 minutes.
-- Coverage. `coverage run --branch stalehost.py --self-test` reports @@COVWIN@@ on Windows. On Linux it
-  reports @@COVLIN@@: the lines it cannot reach there are the success path of the Windows registry
-  read. The success path of `_load_arcpy` is reached with a stand-in module on `sys.modules`. The
-  `if __name__` guard carries `# pragma: no branch`, because its false branch is an import and the
+- Coverage. `coverage run --branch stalehost.py --self-test` reports 99% (1543 statements, 322 branches) on Windows. The
+  one partial branch is the `sys.platform == "win32"` test that guards the `icacls` check of the access
+  list: its other side only runs elsewhere. On Linux it reports 99% (16 statements missed). The lines it cannot reach
+  there are the success path of the Windows registry read and the body of that `icacls` check, which
+  needs NTFS. The Win32 calls themselves run on every host, against a stand-in that returns the codes
+  it is told to. The success path of `_load_arcpy` is reached with a stand-in module on `sys.modules`.
+  The `if __name__` guard carries `# pragma: no branch`, because its false branch is an import and the
   file is only measured by running it. Code that runs in the child process is not measured by
   coverage, so the worker is also run in process.
-- The self-test prints @@COUNT@@ assertions on Windows with Python 3.13 and @@COUNT@@ on Linux with
-  Python 3.12. They are equal because no case is skipped on either host.
+- The self-test prints 309 assertions on Windows with Python 3.13 and 309 on Linux with
+  Python 3.12, and the two outputs are identical line for line. No case is skipped. The one
+  assertion that reads real access lists with `icacls` is true by construction off Windows, where
+  there is no list to read. That is why the count does not change.
 
 ## Contributing
 
