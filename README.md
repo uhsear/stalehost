@@ -49,8 +49,8 @@ are. See [Limits](#limits). For an `.sde` it does not edit bytes. It asks ArcGIS
 rebuild the connection.
 
 A search of GitHub repositories for `stalehost`, `aprx repoint`, `sde connection repoint` and
-`arcgis stale host` found one unrelated project that shares the name (a Red Hat Satellite clean-up)
-and nothing else with this scope. That is a weak claim, because a repository search is not a code
+`arcgis stale host` found an unrelated project that shares the name (a Red Hat Satellite clean-up),
+the author's own earlier copy of this repository, and nothing else with this scope. That is a weak claim, because a repository search is not a code
 search, and it is not a reason to think none exists.
 
 A recursive text search is the other alternative. It reads the bytes of the container, and for an
@@ -62,6 +62,8 @@ stalehost self-test: stand-in arcpy, no network, no registry write
 ----------------------------------------------------------------------
 ...
 PASS  a non-ASCII host name is refused rather than never matching
+...
+PASS  a host typed as a UNC path is refused, or the rewrite would cut the slashes out of every path  <-- pinned defect
 ...
 PASS  the neighbouring server OLDHOST-10 is not a hit  <-- pinned defect
 ...
@@ -101,12 +103,14 @@ PASS  a second backup in the same second is numbered and the first survives  <--
 PASS  a rename that fails leaves the file, the temp file and the backups as they were  <-- pinned defect
 PASS  a file saved while it was being rewritten is not overwritten  <-- pinned defect
 PASS  a backup that does not match the original stops the swap  <-- pinned defect
+PASS  a backup that differs by one byte but keeps its size and time stops the swap  <-- pinned defect
 PASS  a list that blocks inheritance is copied as one that blocks it  <-- pinned defect
 ...
 PASS  a file whose access list cannot be copied is left as it was, with no backup  <-- pinned defect
 PASS  a project locked to one account is still locked after the rewrite, and so is its backup (read from icacls on Windows)  <-- pinned defect
 ...
 PASS  an error that quotes the password has it scrubbed before it is printed  <-- pinned defect
+PASS  an error that quotes the login name, in any case, has it scrubbed too  <-- pinned defect
 ...
 PASS  the worker mode refuses to run without --apply, so nothing writes without it  <-- pinned defect
 ...
@@ -115,7 +119,7 @@ PASS  a plan never starts the ArcGIS Pro Python  <-- pinned defect
 PASS  a worker that hangs on a dead database is killed and counted, and the file is untouched  <-- pinned defect
 PASS  without --apply nothing on disk changes, not one byte and not one new file  <-- pinned defect
 ...
-PASS  the password is in no file the run wrote and not in its output  <-- pinned defect
+PASS  no plain-text password reaches a file the stand-in wrote or the tool output; a real rebuilt .sde stores one  <-- pinned defect
 ...
 PASS  a second run fixes nothing and takes no new backup  <-- pinned defect
 ...
@@ -132,15 +136,15 @@ PASS  a unique prefix of --apply is refused by the parser, so --ap cannot write 
 PASS  there is no flag that takes a password  <-- pinned defect
 ...
 ----------------------------------------------------------------------
-309 assertions, 0 failed
+351 assertions, 0 failed
 ```
 
-The full run prints all 309 assertions. Each `...` line is where this block is cut.
+The full run prints all 351 assertions. Each `...` line is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `zipfile`, `os`, `json`, `argparse`, `subprocess`,
-`filecmp`, `shutil`, `time`. No `arcpy` in this process, no install step and no network. It runs on
+`filecmp`, `shutil`, `time`, `re` and `stat`, plus `ctypes` and `winreg` on Windows only. No `arcpy` in this process, no install step and no network. It runs on
 ArcGIS Pro's Python, on a plain `python3`, and on a device with no Esri software at all.
 
 Rebuilding an `.sde` is the one step that needs ArcGIS Pro. The tool starts Pro's `python.exe` as a
@@ -463,7 +467,8 @@ The same device, the same files, exit 1.
 **It refuses to print file contents.** The output is paths and counts. A connection string holds a
 user name and sometimes a stored credential, and this output goes to a fleet console that a wide
 group can read. Sample paths are truncated from the left, keeping the file name, because the
-meaningful part of a GIS project path is its end. A database login name is not printed either.
+meaningful part of a GIS project path is its end. A database login name is not printed either, and a driver message that quotes it has it
+replaced, as a password is.
 
 **Nothing writes without `--apply`.** Without `--to` and `--apply` no file is opened for writing, no
 registry value is set, no child process starts, no database is contacted and no network call is made.
@@ -561,7 +566,7 @@ tolerate a line that is not JSON.
   and wrote a file that names the new host in UTF-16 and holds the password in neither ASCII nor
   UTF-16. The parent and child protocol, the swap, the backups and every failure were run against a
   stand-in `arcpy`. The real Pro Python was also run as the child against a real connection file with
-  an unreachable server, and returned the `failed` row above. Whether `Describe` returns the
+  an unreachable server, and returned a `failed` row that says arcpy cannot read the connection properties. Whether `Describe` returns the
   `instance` text in the form `CreateDatabaseConnection` expects, for example `sde:sqlserver:HOST`,
   was not seen, so that string is passed on unchanged and that step is unverified.
 - **The backup of an `.sde` holds the stored credential the original held.** It has the original's
@@ -653,22 +658,55 @@ tolerate a line that is not JSON.
   they have the folder's default access list. Use a folder that only trusted accounts can read.
 - A run that is killed, by Ctrl+C or a reboot, between the worker and the swap leaves
   `*-stalehost-tmp.sde` files that hold a saved password. The next run removes only the temp file of
-  a path it handles again. Delete stray `*-stalehost-tmp.sde` files after an interrupted run.
+  a path it handles again. Delete stray `*-stalehost-tmp.sde` files after an interrupted run. A leftover temp file that sits next to
+  a `.sde` the run handles again is deleted with no backup.
 - A crash in the middle of `--apply` prints a single `ERROR` line without the rows. List the
   `.stalehost-bak-*` files to see what was changed.
 - The hidden `--sde-worker` flag is the child half of the `.sde` rebuild. Any local user can run
   `--sde-worker --apply` with a job on stdin and make ArcGIS Pro write `.sde` files at paths of their
   choice. That user already has write access to those paths, so the flag exposes the mode and gives
   no new right.
-- Coverage. `coverage run --branch stalehost.py --self-test` reports 100% on Windows (COVSTMT
-  statements, COVBR branches). On Linux it reports 99% (16 statements missed, at the import of `winreg`,
+- **A short host name matches inside binary data.** A host of two or three characters can match inside
+  the binary parts of an `.aprx`, such as a PNG thumbnail, and the rewrite would then corrupt that part.
+  Measured on random 100 KB blobs: the host `db` matched 20 of 20, and a five character host matched 0
+  of 20. Give the full retired name, not a fragment.
+- The old host is matched as a label of any dotted name, so `a.OLDHOST-1` is a hit and is rewritten to
+  `a.NEWHOST`, even when `a.` is another domain.
+- Only ASCII, UTF-8 and UTF-16LE text is searched. A UTF-32 file that names the host is never found. A
+  UTF-16BE file is found only when a character follows the name, so one that ends with the name reads
+  `CLEAN`.
+- If a symlink and its target are both hits, the second one in sorted order can be reported `failed`
+  with `no whole-token match to rewrite`, because the first rewrite already changed the shared bytes,
+  while the run still ends `CLEAN` (reproduced on Linux with Python 3.12).
+- `--path` takes a folder. A single file there reads nothing and the run is `UNVERIFIED` with
+  `rootfail=yes`.
+- A repoint rewrites every whole-token match in a project, including the name of a connection file such
+  as `OLDHOST-1_gis.sde`. The project then points at `NEWHOST_gis.sde`, and the `.sde` on disk keeps its
+  old name, so that path leads to a file that does not exist.
+- The check after an `.sde` rebuild looks only for the new host name. It cannot tell whether the
+  `instance` string that `Describe` returned is in the form `CreateDatabaseConnection` expects.
+- The ArcGIS Pro child does not turn off geoprocessing history. Esri says connection information can be
+  stored in the geoprocessing history logs, and the tool does not check whether the password reaches
+  them. Check the history of the account that runs `--apply` before you trust that none does.
+- The child process starts with the inherited environment and the script's folder on `sys.path`. Run the
+  tool from a folder that only trusted accounts can write to, so a planted module cannot be imported.
+- Of the child's error output, only the last line is shown, after scrubbing. A password in an earlier
+  line of a traceback is dropped, not shown.
+- A standard input that is closed or is `NUL`, as in `< NUL` on Windows, reads as a terminal. The
+  `--passwords-stdin` run then exits 64 with the message about a pipe, which is safe but not exact.
+- If removing the backup or the temp file fails during the cleanup after a failed swap, that error
+  replaces the first one on the row. The original file is untouched in every path.
+- A password object nested too deeply to parse exits 64 with the same generic message as any other
+  bad stdin.
+- Coverage. `coverage run --branch stalehost.py --self-test` reports 100% on Windows (1735
+  statements, 340 branches). On Linux it reports 99% (16 statements missed, at the import of `winreg`,
   the success path of the Windows registry read, and the body of the `icacls` round trip, which needs
   NTFS and Windows). The Win32 calls themselves run on every host, against a stand-in that returns the codes
   it is told to. The success path of `_load_arcpy` is reached with a stand-in module on `sys.modules`.
   The `if __name__` guard carries `# pragma: no branch`, because its false branch is an import and the
   file is only measured by running it. Code that runs in the child process is not measured by
   coverage, so the worker is also run in process.
-- The self-test prints 340 assertions on Windows with Python 3.13 and 340 on Linux with
+- The self-test prints 351 assertions on Windows with Python 3.13 and 351 on Linux with
   Python 3.12, and the two outputs are identical line for line. No case is skipped. The one
   assertion that reads real access lists with `icacls` is true by construction off Windows, where
   there is no list to read. That is why the count does not change. The self-test also passes when the

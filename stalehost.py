@@ -114,6 +114,7 @@ import argparse
 import filecmp
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -276,6 +277,11 @@ def host_needles(host):
         ascii_needle = lowered.encode("ascii")
     except UnicodeEncodeError:
         raise ValueError("host name must be ASCII: %s" % host)
+    if any(byte not in HOST_BYTES for byte in ascii_needle):
+        # A UNC form such as \OLDHOST-1 would match with its slashes, and
+        # the rewrite would then delete them from every path in the file.
+        raise ValueError("host name may hold only letters, digits, '.', '-' "
+                         "and '_': %s" % host.strip())
     return ascii_needle, lowered.encode("utf-16-le")
 
 
@@ -539,11 +545,20 @@ def sde_temp_path(path):
     return stem + "-stalehost-tmp.sde"
 
 
-def scrub(text, secrets):
+def scrub(text, secrets, logins=()):
     """Replace every secret in text with ***. Longest first, so a password that
-    holds another one is removed whole."""
+    holds another one is removed whole.
+
+    A login name is removed too, whatever its case, because a driver message
+    such as "Login failed for user" quotes it. It is matched as a whole word,
+    so a login called sa does not cut the word password in half.
+    """
     for secret in sorted(secrets, key=len, reverse=True):
         text = text.replace(secret, "***")
+    for login in sorted(logins, key=len, reverse=True):
+        if login:
+            text = re.sub(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                          % re.escape(login), "***", text, flags=re.IGNORECASE)
     return text
 
 
@@ -568,7 +583,7 @@ def parse_passwords(data):
     """
     try:
         loaded = json.loads(data.decode("utf-8-sig"))
-    except ValueError:
+    except (ValueError, RecursionError):
         loaded = None
     if not isinstance(loaded, dict) or not all(
             isinstance(value, str) and value for value in loaded.values()):
@@ -985,13 +1000,13 @@ def scan_roots(path, roots_source=None):
 
 # ------------------------------------------------------- remediation (files)
 
-def describe_error(exc, secrets=()):
+def describe_error(exc, secrets=(), logins=()):
     """One short line for a failure. The exception type first, then its text.
 
     Secrets are removed before the cut, so a password that straddles the 200
     character limit is not left half showing.
     """
-    return scrub("%s: %s" % (type(exc).__name__, exc), secrets)[:200]
+    return scrub("%s: %s" % (type(exc).__name__, exc), secrets, logins)[:200]
 
 
 def result_row(path, status, detail="", backup=""):
@@ -1214,14 +1229,15 @@ def sde_worker(job, loader, out):
     """
     arcpy = loader()
     secrets = list(job["passwords"].values())
+    logins = list(job["passwords"])
     for path in job["files"]:
         try:
             status, detail = _sde_one(arcpy, path, job)
         except Exception as exc:
-            status, detail = "failed", describe_error(exc, secrets)
+            status, detail = "failed", describe_error(exc, secrets, logins)
         out.write(RESULT_MARK + json.dumps(
             {"path": path, "status": status,
-             "detail": scrub(detail, secrets)}) + "\n")
+             "detail": scrub(detail, secrets, logins)}) + "\n")
     out.flush()
     return 0
 
@@ -1234,12 +1250,13 @@ def run_sde_worker(python, script, job, timeout=SDE_WORKER_SECONDS):
     on the machine can read from the process list.
     """
     secrets = list(job["passwords"].values())
+    logins = list(job["passwords"])
     try:
         child = subprocess.Popen([python, script, "--sde-worker", "--apply"],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
     except OSError as exc:
-        return {}, describe_error(exc, secrets)
+        return {}, describe_error(exc, secrets, logins)
     try:
         out, err = child.communicate(json.dumps(job).encode("utf-8"),
                                      timeout=timeout)
@@ -1259,7 +1276,7 @@ def run_sde_worker(python, script, job, timeout=SDE_WORKER_SECONDS):
     if child.returncode != 0:
         tail = err.decode("utf-8", "replace").strip().splitlines()[-1:]
         problem = "the ArcGIS Pro Python exited %d %s" % (
-            child.returncode, scrub("".join(tail), secrets)[:120])
+            child.returncode, scrub("".join(tail), secrets, logins)[:120])
     return results, problem
 
 
@@ -1273,6 +1290,7 @@ def repoint_sde(paths, host, new, apply, passwords, python, now, script,
         return [result_row(path, "would", "recreate with ArcGIS Pro Python")
                 for path in paths]
     secrets = list(passwords.values())
+    logins = list(passwords)
     rows = []
     befores = {}
     for path in paths:
@@ -1295,10 +1313,11 @@ def repoint_sde(paths, host, new, apply, passwords, python, now, script,
                 backup = swap_in(path, temp, befores[path], now)
                 rows.append(result_row(path, "fixed", "recreated", backup))
             else:
-                rows.append(result_row(path, status, scrub(detail, secrets)))
+                rows.append(result_row(path, status,
+                                       scrub(detail, secrets, logins)))
         except Exception as exc:
             rows.append(result_row(path, "failed",
-                                   describe_error(exc, secrets)))
+                                   describe_error(exc, secrets, logins)))
         finally:
             if os.path.isfile(temp):
                 remove_file(temp)
@@ -1417,8 +1436,8 @@ class management(object):
     def CreateDatabaseConnection(**kw):
         behaviour = _state["behaviour"]
         if behaviour == "raise":
-            raise RuntimeError("login failed for password "
-                               + kw.get("password", ""))
+            raise RuntimeError("login failed for user %s password %s" % (
+                kw.get("username", "").upper(), kw.get("password", "")))
         if behaviour == "hang":
             time.sleep(30)
         if behaviour == "noout":
@@ -1512,6 +1531,12 @@ def self_test():
         raises(lambda: host_needles("   "), "a blank host name is refused")
         raises(lambda: host_needles("a"),
                "a one character host name is refused, because it matches inside utf-16-le text  <-- pinned defect")
+        check(host_needles("ab")[0] == b"ab",
+              "a two character host name is the smallest one accepted  <-- pinned defect")
+        raises(lambda: host_needles("\\\\OLDHOST-1"),
+               "a host typed as a UNC path is refused, or the rewrite would cut the slashes out of every path  <-- pinned defect")
+        raises(lambda: host_needles("old host"),
+               "a host name with a space inside is refused")
         raises(lambda: host_needles(u"OLDH\u00d6ST"),
                "a non-ASCII host name is refused rather than never matching")
         check(host_needles(host)[0] == b"oldhost-1",
@@ -1568,6 +1593,8 @@ def self_test():
               "a utf-16-le word unit right before the host, at byte 2, is not a boundary  <-- pinned defect")
         check(not bytes_contain_host(u"OLDHOST-1x".encode("utf-16-le"), host),
               "a utf-16-le word unit as the last unit after the host is not a boundary  <-- pinned defect")
+        check(bytes_contain_host(u"a OLDHOST-1".encode("utf-16-le") + b"A", host),
+              "one stray byte after a utf-16-le host at the end of the buffer is a boundary, not an index error  <-- pinned defect")
 
         # ---- format routing
         check(looks_like_zip(b"PK\x03\x04rest"), "a PK header is a zip")
@@ -1845,6 +1872,15 @@ def self_test():
         check(scan_tree([local_root], host).scanned == 0
               and scan_tree([local_root], host, include_temp=True).aprx == 1,
               "a Temp folder found below the root is still pruned, and --scan-temp reaches it")
+        exact_root = os.path.join(workdir, "AppData", "Local", "Temp")
+        os.makedirs(os.path.join(exact_root, "sub"), exist_ok=True)
+        shutil.copy(stale_aprx, os.path.join(exact_root, "sub", "p.aprx"))
+        exact_hits = []
+        scan_tree([exact_root], host, hits=exact_hits)
+        check(any(path.endswith(os.path.join("sub", "p.aprx"))
+                  for path, _ in exact_hits)
+              and not inside_temp("c:/u/appdata/local/temp", 23),
+              "a root that ends exactly at Temp is scanned all the way down  <-- pinned defect")
         check(not inside_temp("c:/u/appdata/local/temp/p/maps", 25)
               and inside_temp("c:/u/appdata/local/temp", 12)
               and inside_temp("c:/u/appdata/local/temp/a/appdata/local/temp", 25),
@@ -2117,6 +2153,9 @@ def self_test():
               "and it prints the actionable paths, fixable ones first")
         check("EXAMPLEDB" not in out and "workspaceConnectionString" not in out,
               "it reports paths and counts, never file contents  <-- pinned defect")
+        code, out = run(["\\\\" + host, "--path", tree, "--to", "NEWHOST"])
+        check(code == 64 and "may hold only letters" in out,
+              "a retired host typed as a UNC path exits 64 before any file is read  <-- pinned defect")
         code, out = run(["  %s  " % host, "--path", tree])
         check(code == 1 and "old=%s " % host in out,
               "a host name typed with stray spaces is reported without them")
@@ -2255,6 +2294,11 @@ def self_test():
         check(rewrite_host(wide_in, host, new)
               == (u"SERVER=NEWHOST;".encode("utf-16-le"), 1),
               "a utf-16-le host is replaced and stays utf-16-le  <-- pinned defect")
+        wide_before = u"srv MYOLDHOST-1 ok".encode("utf-16-le")
+        wide_after = u"srv OLDHOST-1x ok".encode("utf-16-le")
+        check(rewrite_host(wide_before, host, new) == (wide_before, 0)
+              and rewrite_host(wide_after, host, new) == (wide_after, 0),
+              "a utf-16-le neighbour on either side is left alone by the rewrite, as by the scan  <-- pinned defect")
         check(rewrite_host(b"\x00" + wide_in, host, new)
               == (b"\x00" + u"SERVER=NEWHOST;".encode("utf-16-le"), 1),
               "a utf-16-le host at an odd offset is replaced too")
@@ -2282,6 +2326,9 @@ def self_test():
               "the new connection is built beside the old one and still ends in .sde")
         check(scrub("x abcdef y abc", ["abc", "abcdef"]) == "x *** y ***",
               "a password that holds another is removed whole, longest first  <-- pinned defect")
+        check(scrub("sa failed, sas and password", [], ["SA", ""])
+              == "*** failed, sas and password",
+              "a login is removed as a whole word in any case, and an empty login removes nothing  <-- pinned defect")
         check(scrub("pw then pw again", ["pw"]) == "*** then *** again",
               "a password quoted twice in one message is removed both times  <-- pinned defect")
         long_error = RuntimeError("x" * 181 + " hunter2-SECRET")
@@ -2301,6 +2348,7 @@ def self_test():
                 ("a list", b'["TOPSECRET"]'),
                 ("a number for a password", b'{"u": 5, "m": "TOPSECRET"}'),
                 ("an empty password", b'{"u": ""}'),
+                ("nested too deep to parse", b"[" * 100000 + b"TOPSECRET"),
                 ("not utf-8", b"\xff\xfe TOPSECRET")):
             problem = outcome(lambda d=data: parse_passwords(d))
             check(isinstance(problem, ValueError)
@@ -2492,6 +2540,21 @@ def self_test():
               and not backups_of("badcopy.lyrx"),
               "a backup that does not match the original stops the swap  <-- pinned defect")
 
+        def quiet_copy(source, destination):
+            shutil.copy2(source, destination)
+            data = read_bytes(destination)
+            _write(destination, bytes(bytearray([data[0] ^ 1])) + data[1:])
+            stamp = os.stat(source)
+            os.utime(destination, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+        target = stale_copy(stale_lyrx, "quietcopy.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               copy=quiet_copy))
+        check(isinstance(problem, ValueError) and read_bytes(target) == original
+              and not backups_of("quietcopy.lyrx"),
+              "a backup that differs by one byte but keeps its size and time stops the swap  <-- pinned defect")
+
         # ---- the access list. A new file takes its folder's list unless told
         # otherwise, which widened a locked project. The stand-in below plays
         # the Win32 calls, so the same cases run on every host.
@@ -2672,6 +2735,9 @@ def self_test():
               "the worker reports one status per file: created, declined, failed, failed")
         check(secret not in sink.getvalue() and "***" in seen[proc["boom"]]["detail"],
               "an error that quotes the password has it scrubbed before it is printed  <-- pinned defect")
+        check("sde_user" not in sink.getvalue().lower()
+              and seen[proc["boom"]]["detail"] == "RuntimeError: login failed for user *** password ***",
+              "an error that quotes the login name, in any case, has it scrubbed too  <-- pinned defect")
         check(b"instance=NEWHOST\\SQLEXPRESS"
               in read_bytes(sde_temp_path(proc["ok"])),
               "a leftover temp connection is removed before a new one is built")
@@ -2980,7 +3046,7 @@ def self_test():
         check(not any(secret.encode("ascii") in data
                       for data in everything.values())
               and secret not in out,
-              "the password is in no file the run wrote and not in its output  <-- pinned defect")
+              "no plain-text password reaches a file the stand-in wrote or the tool output; a real rebuilt .sde stores one  <-- pinned defect")
         check(any(r["path"].endswith("raises.sde") and "***" in r["detail"]
                   for r in report["repoint"]["results"]),
               "and the error that quoted it came back scrubbed")
@@ -3401,7 +3467,7 @@ def main(argv=None, stdin=None, arcpy_loader=None):
         # non-zero exit that means nothing in particular is how an unverified
         # device gets read as a broken script and then ignored. Fail toward
         # remediation with a line the grid can show.
-        print("%s STALEHOST %s" % (ERROR, scrub(str(exc), passwords.values())))
+        print("%s STALEHOST %s" % (ERROR, scrub(str(exc), passwords.values(), passwords)))
         return 1
 
     state, code = verdict(walk, args.fail_on_sde, args.fail_on_text)
