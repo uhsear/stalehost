@@ -14,10 +14,10 @@ Get-ChildItem -Path C:\ -Recurse -ErrorAction SilentlyContinue | Select-String O
 
 Every device reports healthy. The fleet console shows a clean estate and you sign off.
 
-Two things were wrong. On Windows PowerShell 5.1 that recursive enumeration stops at the first
-`UnauthorizedAccessException`, and one protected user profile is enough, so most devices returned
-nothing after reading almost nothing. `SilentlyContinue` hid it. And an `.aprx` is a ZIP archive, so
-even on the devices that finished, the host name was never in the bytes the search read.
+Two things were wrong. An `.aprx` is a ZIP archive, so even on the devices that finished, the host
+name was never in the bytes the search read. And `SilentlyContinue` says nothing about what it
+skipped. On Windows PowerShell 5.1 a folder the account may not open is passed over without a word,
+so a device that read half its disk looks the same as one that read all of it.
 
 Nobody found out until Monday, when the projects opened with red exclamation marks on every layer.
 
@@ -48,9 +48,10 @@ file. Esri's documentation does not say how an `.aprx` is stored, so that part r
 are. See [Limits](#limits). For an `.sde` it does not edit bytes. It asks ArcGIS Pro's own Python to
 rebuild the connection.
 
-A search of GitHub for `stalehost`, `updateConnectionProperties`, `aprx repoint` and `sde repoint`
-found no other tool with this scope. That is a weak claim, because a repository search is not a
-code search, and it is not a reason to think none exists.
+A search of GitHub repositories for `stalehost`, `aprx repoint`, `sde connection repoint` and
+`arcgis stale host` found one unrelated project that shares the name (a Red Hat Satellite clean-up)
+and nothing else with this scope. That is a weak claim, because a repository search is not a code
+search, and it is not a reason to think none exists.
 
 A recursive text search is the other alternative. It reads the bytes of the container, and for an
 `.aprx` those bytes do not contain the host name. A self-test case pins that.
@@ -214,7 +215,8 @@ Every row used to open with the same dozen identical characters, so the one word
 the one that got cut off.
 
 `unverified=`, `rootfail=` and `timeout=` are printed only when they changed the verdict, so a clean
-device stays on one short line. `pro=` is a triage hint: `pro=no` means this device could never
+device stays on one short line. `skippeddirs=` is printed when a subfolder would not list. It does
+not change the verdict. See [What it refuses](#what-it-refuses). `pro=` is a triage hint: `pro=no` means this device could never
 rebuild an `.sde`. `textext=` is always last and says which text extensions this run read, so a
 `CLEAN` states what it covered.
 
@@ -232,9 +234,10 @@ Four kinds of file, because those are the kinds that hold a server name a remedi
 - **`.lyrx`** is CIM JSON on disk, and is sometimes a ZIP instead. It is routed by the `PK\x03\x04`
   local file header rather than by its extension, because a zipped `.lyrx` read as text matches
   nothing and reports the layer as already repointed.
-- **`.sde`** is a length-prefixed binary property set. There is no text layer to decode. The host
-  name is stored as UTF-16LE with no byte order mark, at whatever offset the property set landed on.
-  Derived and legacy files can carry an ASCII copy instead.
+- **`.sde`** is a binary property set. There is no text layer to decode. Esri does not document the
+  format. On the files from ArcGIS Pro 3.6 that this was run against, the host name is stored as
+  UTF-16LE with no byte order mark, at whatever offset the property set landed on. Derived and
+  legacy files can carry an ASCII copy instead, so both are searched.
 - **Text**: `.py`, `.bat`, `.cmd`, `.ps1`, `.sql` and `.ini`, read as bytes so a UTF-16 script from
   the PowerShell ISE is found too. `--text-ext` widens the list. Text is reported, and it is never
   rewritten.
@@ -281,14 +284,18 @@ grown to `OLDHOST-1.example.org.example.org`.
 3. The original is compared with the size and time stamp taken before step 1. A project someone
    saved in the meantime is refused, not overwritten.
 4. The original is copied to `<name>.stalehost-bak-<UTC time stamp>` and compared byte for byte. If
-   that name exists, `.1`, `.2` and so on are tried. A backup is never overwritten and never deleted.
+   that name exists, `.1`, `.2` and so on are tried. A backup is never overwritten. It is deleted
+   only when the swap it was taken for failed and the original is untouched.
 5. `os.replace` puts the new file in place. Python documents it as atomic when it succeeds, and as
    able to fail across filesystems, which is why the new file is built in the same folder. If the
    rename fails, because another process holds the file open, the backup is removed again and the
-   original is exactly as it was.
+   original is exactly as it was. The same holds when the copy itself fails part way, as a full disk
+   does: the partial backup is removed.
 
 If any step fails, that file is reported `failed` and left as it was, and the run goes on to the next
-file.
+file. A read-only project cannot be replaced on Windows. It is reported `failed` with the error from
+the rename, and the staged file and the backup are removed, because both inherit the read-only
+attribute and cleaning them up clears it first. Clear the attribute on the project and run again.
 
 **An `.sde`** is a binary property set and is never edited. The tool starts the Python that ships with
 ArcGIS Pro (`--pro-python`) as a child process and runs this same file there in a hidden worker mode,
@@ -317,7 +324,7 @@ There is no flag that takes a password, and the environment is never read for on
 process on its stdin and nowhere else, so it is not in any process listing. A terminal on stdin is
 refused and the tool does not prompt. Logins are matched without regard to case. Every message that
 comes back from the child, and every error line the tool prints, has each password replaced with
-`***` first. A login that has no password in the object is reported `needs-password`, and its name
+`***` before the message is cut to length. A login that has no password in the object is reported `needs-password`, and its name
 is not printed. Two keys that differ only in case name one login. If their passwords differ the input
 is refused, because a last-one-wins choice would pick one without saying so.
 
@@ -340,11 +347,15 @@ one account on the new file and on the backup. Off Windows the mode bits are the
 `shutil.copymode` has copied them, so the step does nothing.
 
 **The exit code is read after the work.** After `--apply` the tree is scanned again and the exit code
-is the verdict for the tree as it now stands. A project that could not be rewritten still says
-`STALE`, exit 1. A repointed project is read again by the matcher before the run says `CLEAN`.
+is the verdict for the tree as it now stands. An `.aprx` or `.lyrx` that could not be rewritten still says
+`STALE`, exit 1. A repointed project is read again by the matcher before the run says `CLEAN`. A
+stale `.sde` that was declined, failed or needs a password is different: it stays `SDEONLY`, exit 0,
+unless you pass `--fail-on-sde`. See [Limits](#limits).
 
 A real run on a small tree, on a Windows machine with ArcGIS Pro 3.6. The `.aprx` is a project saved
-by Pro itself:
+by Pro itself, with one layer on a file geodatabase inside a folder named `OLDHOST-1`. After the
+run the folder was renamed to `NEWHOST`, and `arcpy.mp.ArcGISProject` opened the project and read the
+layer's database as the `NEWHOST` path:
 
 ```
 $ python stalehost.py OLDHOST-1 --path . --to NEWHOST
@@ -370,9 +381,9 @@ CLEAN STALEHOST old=OLDHOST-1 fix=0 (aprx=0 lyrx=0) sde=0 text=0 scanned=3 unrea
 
 ./maps/Neighbour.lyrx
 ./maps/Parcels.lyrx
-./maps/Parcels.lyrx.stalehost-bak-20261022T231053Z
+./maps/Parcels.lyrx.stalehost-bak-20261030T025415Z
 ./maps/Project.aprx
-./maps/Project.aprx.stalehost-bak-20261022T231053Z
+./maps/Project.aprx.stalehost-bak-20261030T025415Z
 ```
 
 The second `--apply` fixed nothing and took no new backup. `Neighbour.lyrx` names `OLDHOST-10`, and
@@ -400,29 +411,22 @@ answer one question.
 
 This version lower-cases the bytes once. `bytes.lower()` folds only ASCII A-Z and leaves every other
 byte alone, so the single lowered buffer serves an ASCII needle and a UTF-16LE needle alike. The
-search runs at every byte offset, not only even ones, so alignment does not matter. Measured here on
-a 64 KB buffer, 300 runs each:
-
-```
-decode to text, three decodes, regex : 2.38 ms
-one lowered buffer, two byte needles : 0.06 ms
-```
-
-Forty times is not the point on one file. It is the point on a connection cache with a thousand
-`.sde` in it, which is what a workstation that has used ArcGIS Pro for two years actually holds.
+search runs at every byte offset, not only even ones, so alignment does not matter. The saving is
+small on one file. It matters on a connection cache that holds very many `.sde` files.
 
 ## What it refuses
 
-**It refuses to call an unread tree clean.** A directory that will not enumerate is skipped and
-counted, not ignored. A root that will not enumerate makes the whole device `UNVERIFIED`, because
-the answer for that device is unknown. A subdirectory that will not enumerate does not, because
+**It refuses to call an unread tree clean, with two exceptions that it counts.** A root that will not
+enumerate makes the whole device `UNVERIFIED`, because the answer for that device is unknown. A
+project or script that will not open is `UNVERIFIED` too: a scanner that returns "no hits" for a
+file it could not read gives exactly the answer that is certainly wrong. The two exceptions are a
+subfolder that will not list and an `.sde` that will not open. A subfolder is skipped, counted in
+`skippeddirs=` and in the JSON field `skippedDirectories`, and does not change the verdict, because
 access denied on a protected profile is routine on Windows and would otherwise flag every device in
-the fleet forever. A project that will not open is `UNVERIFIED` too: a scanner that returns "no
-hits" for a file it could not read gives exactly the answer that is certainly wrong.
-
-A full walk of both local fixed drives on the workstation this was written on took under a minute,
-read about a hundred and fifty documents and found a handful it could not open. Those are why the
-counter exists.
+the fleet forever. A stale project inside such a folder is not seen, so a `CLEAN` with
+`skippeddirs=` above zero is a weaker claim than one without. An unread `.sde` is counted in
+`unreadable=` and does not change the verdict unless you pass `--fail-on-sde`, because most
+connection files cannot be repointed unattended anyway.
 
 **It refuses to loop.** The three failure states below fail toward remediation on purpose. An
 idempotent remediation changes nothing on a clean device, while a missed device means broken
@@ -441,10 +445,8 @@ SDEONLY STALEHOST old=OLDHOST-1 fix=0 (aprx=0 lyrx=0) sde=1 text=0 scanned=1 unr
 
 That run exits 0.
 
-A database-authenticated `.sde` stores a password, so repointing one needs a person to supply it. On
-the dry run that produced this tool, every one of the thousand-odd `.sde` files found on one
-workstation was database-authenticated and none was repointed automatically. Without ArcGIS Pro on
-the device, arcpy cannot rewrite one at all. Letting `.sde` set exit 1 makes the fleet tool re-run a
+A database-authenticated `.sde` stores a password, so repointing one needs a person to supply it.
+Without ArcGIS Pro on the device, arcpy cannot rewrite one at all. Letting `.sde` set exit 1 makes the fleet tool re-run a
 remediation forever against a device it can never clean. The `sde=` count is the manual worklist
 instead.
 
@@ -476,20 +478,26 @@ application detection rule:
 |---|---|
 | 1 | Issue found, or the scan could not be trusted. Run the remediation. |
 | 0 | Nothing for the remediation to do. |
-| 64 | Usage error. No host name, a host that is not ASCII, an unusable `--to`, or `--apply` or `--passwords-stdin` without what they need. |
+| 64 | Usage error. No host name, a host that is not ASCII or is one character long, an unusable `--to`, `--apply` or `--passwords-stdin` without what they need, or an argument the parser refuses: an unknown flag, a refused abbreviation such as `--ap`, a flag with no value. |
 
 | State | Code | When |
 |---|---|---|
 | `STALE` | 1 | A stale `.aprx` or `.lyrx` was found, or `--fail-on-sde` and a stale `.sde`, or `--fail-on-text` and a stale text file. |
 | `INCOMPLETE` | 1 | The walk hit `--max-seconds` before it finished. |
 | `UNVERIFIED` | 1 | A scan root would not enumerate, or a project or script would not open. |
-| `ERROR` | 1 | The tool itself failed. The reason is on the line. |
+| `ERROR` | 1 | The tool itself failed. The reason is on the line, as plain text even with `--json`. |
 | `TEXTONLY` | 0 | Stale text only. Nothing here rewrites text. |
 | `SDEONLY` | 0 | Stale `.sde` only. |
 | `CLEAN` | 0 | Nothing stale, and the whole tree was read. |
 
 64 is reserved for an argument mistake, which happens while the package is being built and never on
-a deployed run, where the arguments are fixed. Every runtime failure is 1.
+a deployed run, where the arguments are fixed. Every runtime failure is 1. The parser's own errors
+are 64 too: the tool replaces the exit code 2 that `argparse` uses, and a self-test case pins it.
+
+Exit 1 means two things: the device has findings, and the tool failed. Only the first word of the
+output tells them apart, so a wrapper that needs the difference must read that word, or the `state`
+field with `--json`. With `--json` an `ERROR` run prints one plain text line, so a collector must
+tolerate a line that is not JSON.
 
 ## Sources
 
@@ -521,6 +529,13 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
   object").
 - [`os.replace`](https://docs.python.org/3/library/os.html#os.replace). Replaces an existing file, can
   fail across filesystems, and is atomic when it succeeds.
+- [`os.chmod`](https://docs.python.org/3/library/os.html#os.chmod). On Windows it can set only the
+  read-only flag, through `stat.S_IWRITE` and `stat.S_IREAD`. The cleanup of a read-only copy uses it.
+- [`zipfile`](https://docs.python.org/3/library/zipfile.html). Writing a second entry with a name that
+  is already in the archive raises a `UserWarning`. See [Limits](#limits).
+- [`argparse`](https://docs.python.org/3/library/argparse.html#allow-abbrev). `allow_abbrev=False`
+  turns off prefix matching of long options. A parser's `error()` method prints usage and exits with
+  status 2, which is the method the tool overrides to exit 64.
 
 ## Limits
 
@@ -528,9 +543,9 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
   at a table that was dropped last week.
 - **An `.aprx` rewrite rests on an undocumented format.** Esri's `ArcGISProject` page does not say that
   an `.aprx` is a ZIP of JSON parts. The scan has relied on it from the start, and every project
-  tried was one. The rewrite was checked once against a real project saved by ArcGIS Pro 3.6: the
-  tool changed it, and `arcpy.mp.ArcGISProject` opened the result and read the layer's database as the
-  new path. A future Pro that changes the layout makes the matcher find nothing, or the read-back
+  tried was one. The rewrite was run against a project saved by ArcGIS Pro 3.6, with a layer on a
+  file geodatabase in a folder named for the old host: the tool changed it, and
+  `arcpy.mp.ArcGISProject` opened the result and read the layer's database as the new path. A future Pro that changes the layout makes the matcher find nothing, or the read-back
   refuse the file. It does not make the tool write a broken project. If you want Esri's route, use
   `updateConnectionProperties`.
 - **Close the project first.** Pro holds a project it has open. A rename onto it fails, and the file
@@ -542,12 +557,13 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
   old host off, or after, from an alias that still resolves.
 - **A successful `.sde` rebuild was never run against a live SQL Server.** There is none on the
   machine this was built on. What was run: the exact `CreateDatabaseConnection` arguments the tool
-  builds, for a database login with a version and for operating-system authentication, were passed to
-  real ArcGIS Pro 3.6. It accepted them and wrote a file that names the new host, does not name the
-  old one, and does not hold the password in ASCII or UTF-16. The parent and child protocol, the swap,
-  the backups and every failure were run against a stand-in `arcpy`. The real Pro Python was also run
-  as the child against real connection files with an unreachable server, and returned the `failed`
-  row above. Whether `Describe` returns the `instance` text your connections need was not seen.
+  builds, for a database login with a version, were passed to real ArcGIS Pro 3.6. It accepted them
+  and wrote a file that names the new host in UTF-16 and holds the password in neither ASCII nor
+  UTF-16. The parent and child protocol, the swap, the backups and every failure were run against a
+  stand-in `arcpy`. The real Pro Python was also run as the child against a real connection file with
+  an unreachable server, and returned the `failed` row above. Whether `Describe` returns the
+  `instance` text in the form `CreateDatabaseConnection` expects, for example `sde:sqlserver:HOST`,
+  was not seen, so that string is passed on unchanged and that step is unverified.
 - **The backup of an `.sde` holds the stored credential the original held.** It has the original's
   access list, but it is still a copy of a secret, and the tool never deletes a backup. Remove the
   backups once the new connections work.
@@ -560,15 +576,20 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
 - Only local fixed drives are scanned when `--path` is absent. A mapped drive is another machine's
   tree, and a scan that follows one blocks for the full network timeout when the share is gone.
 - `AppData\Local\Temp` is pruned by default. ArcGIS Pro drops GUID-named scratch `.sde` connections
-  there and never cleans them up: thousands of them on the workstation this was measured on. They are
+  there and never cleans them up, so a long-used workstation holds a very large number. They are
   regenerated on the next launch. A device whose only stale content is scratch reads `CLEAN`. Pass
   `--scan-temp` if you disagree.
+  The test is a substring test on the path, so a sibling such as `AppData\Local\TempState` or
+  `AppData\Local\Temporary` is pruned too. A root that you name with `--path` is scanned all the way
+  down even when it sits inside Temp. Only a Temp folder that the walk finds below the root is pruned.
 - `Windows`, `Program Files`, `Program Files (x86)`, `ProgramData`, `$Recycle.Bin`,
-  `System Volume Information`, `node_modules` and `.git` are skipped at any depth.
+  `System Volume Information`, `node_modules` and `.git` are skipped at any depth. A project folder
+  that happens to be named `Windows` is never read.
 - Junctions and symbolic links are not followed, so the walk cannot cycle. A project reachable only
   through a junction is not seen.
-- A file over 64 MB is refused rather than read into memory, and counted unreadable. Real `.aprx`
-  and `.sde` files are far smaller, and this runs as a privileged account over every local drive.
+- A `.sde`, a plain `.lyrx` or a text file over 64 MB is refused rather than read into memory, and
+  counted unreadable. An `.aprx` or a zipped `.lyrx` is read one archive entry at a time, and the 64 MB
+  cap applies to each entry. The archive file itself has no size cap.
 - Run it in a 64-bit Python. The ArcGIS Pro registry check reads a 64-bit key, and a 32-bit host
   process is redirected to `WOW6432Node`, where no Esri key exists. It asks for the 64-bit view
   explicitly, but only Python's own architecture can be relied on for the rest. Pro is found by the
@@ -577,19 +598,81 @@ a deployed run, where the arguments are fixed. Every runtime failure is 1.
 - The elapsed time is whole seconds, and the cap is checked between directories. A single enormous
   directory can overshoot it. The cap applies to each of the two scans in an `--apply` run. The
   Pro child has its own cap of 30 minutes.
-- Coverage. `coverage run --branch stalehost.py --self-test` reports 99% (1543 statements, 322 branches) on Windows. The
-  one partial branch is the `sys.platform == "win32"` test that guards the `icacls` check of the access
-  list: its other side only runs elsewhere. On Linux it reports 99% (16 statements missed). The lines it cannot reach
-  there are the success path of the Windows registry read and the body of that `icacls` check, which
-  needs NTFS. The Win32 calls themselves run on every host, against a stand-in that returns the codes
+- **A stale `.sde` that was not rebuilt still exits 0.** After `--apply`, an `.sde` that failed, was
+  declined or needs a password stays `SDEONLY`, exit 0, unless you pass `--fail-on-sde`. Only an
+  `.aprx` or `.lyrx` that failed keeps exit 1. A fleet loop therefore reads that device as healthy
+  while the `sde=` count and the `failed` row still show the worklist. A stale `.sde` that cannot be
+  read is also `CLEAN` by default and `UNVERIFIED` with `--fail-on-sde`.
+- **The plan cannot predict every outcome.** `--to` without `--apply` lists each stale `.sde` as
+  `would recreate with ArcGIS Pro Python`. Deciding whether a connection is declined, needs a password
+  or fails takes ArcGIS Pro's `Describe`, and a plan never starts Pro. A plan with three `would` rows
+  can become one `fixed` and two `needs-password` under `--apply`.
+- **Matching is by token, not by connection field.** `_` and `.` count as boundaries. A folder or
+  database named `OLDHOST-1_data`, a name such as `OLDHOST-1.corp`, a domain suffix and a layer name
+  such as `OLDHOST-1 parcels` are all counted stale and rewritten, to `NEWHOST_data`,
+  `NEWHOST.corp` and `NEWHOST parcels`. The rewrite cannot tell a connection from a folder name, and
+  the plan lists files, not occurrences. Review the plan before `--apply`.
+- **Host names of one character are refused.** One ASCII character also matches inside UTF-16
+  text, and the rewrite would corrupt the wide bytes.
+- A symlinked `.aprx` or `.lyrx` file is read through the link, and `os.replace` swaps the link for a
+  regular file. The link target is not touched, and the backup is a copy of the target's bytes.
+- A subdirectory whose `stat()` raises `OSError` is taken for a link and skipped with no counter, so a
+  stale file in it is never seen. A subdirectory that cannot list, or whose `is_dir()` raises, is
+  counted in `skippeddirs=`.
+- A 0-byte `.aprx`, or any `.aprx` that is not a ZIP, is `UNVERIFIED` on every run, and a repoint
+  cannot clear it.
+- A host name that appears only in a zip entry name or in the zip comment is not found, because only
+  the bytes of each entry are searched.
+- The extension `.tar.gz` in `--text-ext` is accepted and can never match, because only the last
+  suffix of a file name is compared.
+- A zip with two entries of the same name is rewritten with a `UserWarning` from `zipfile`. Under
+  `python -W error` that warning is an error, and the file is reported `failed`.
+- **Scrubbing matches the password as given.** A driver message that quotes it escaped, for example
+  with doubled backslashes or as a `repr`, is not scrubbed. Real Esri errors are not known to quote a
+  password.
+- A password object with a repeated key is accepted, and the last value wins. A password file saved as
+  UTF-16, as a PowerShell `>` redirect does, gets the generic `stdin must be one JSON object` error
+  with no hint about the encoding.
+- A password with a non-ASCII character that is piped from Windows PowerShell 5.1 under its default
+  US-ASCII `$OutputEncoding` arrives as `?`. The connection is then rebuilt with the wrong password
+  and the tool cannot detect that. See [Passwords](#repointing).
+- **Passwords are keyed by login name only.** If the same login has a different password on the new
+  host, every rebuild sends the wrong password, and the worker does not stop after the first failure.
+  A SQL login with a lockout policy can be locked out. Supply one password per login and try one
+  file with `--path` first.
+- A rebuilt database-login connection always stores its password (`SAVE_USERNAME`), whether or not
+  the original did. The rebuilt `.sde` takes only the instance, database, version and authentication
+  mode from `Describe`. Any other property of the original, such as encryption options, is not carried
+  over.
+- **With `--apply`, Pro connects to the servers named inside the matched files.** `Describe` and
+  `CreateDatabaseConnection` use the instance string of each `.sde` that names the old host. Only the
+  old host token is swapped, so `other-db.example,OLDHOST-1` becomes `other-db.example,NEWHOST`, and
+  the password is sent to that connection. Do not run `--apply` over a tree you do not trust.
+- The temporary `*-stalehost-tmp.sde` files, which hold the saved password, are all built before any
+  is swapped in, and the backups are made before their access list is fixed. For that short window
+  they have the folder's default access list. Use a folder that only trusted accounts can read.
+- A run that is killed, by Ctrl+C or a reboot, between the worker and the swap leaves
+  `*-stalehost-tmp.sde` files that hold a saved password. The next run removes only the temp file of
+  a path it handles again. Delete stray `*-stalehost-tmp.sde` files after an interrupted run.
+- A crash in the middle of `--apply` prints a single `ERROR` line without the rows. List the
+  `.stalehost-bak-*` files to see what was changed.
+- The hidden `--sde-worker` flag is the child half of the `.sde` rebuild. Any local user can run
+  `--sde-worker --apply` with a job on stdin and make ArcGIS Pro write `.sde` files at paths of their
+  choice. That user already has write access to those paths, so the flag exposes the mode and gives
+  no new right.
+- Coverage. `coverage run --branch stalehost.py --self-test` reports 100% on Windows (COVSTMT
+  statements, COVBR branches). On Linux it reports 99% (16 statements missed, at the import of `winreg`,
+  the success path of the Windows registry read, and the body of the `icacls` round trip, which needs
+  NTFS and Windows). The Win32 calls themselves run on every host, against a stand-in that returns the codes
   it is told to. The success path of `_load_arcpy` is reached with a stand-in module on `sys.modules`.
   The `if __name__` guard carries `# pragma: no branch`, because its false branch is an import and the
   file is only measured by running it. Code that runs in the child process is not measured by
   coverage, so the worker is also run in process.
-- The self-test prints 309 assertions on Windows with Python 3.13 and 309 on Linux with
+- The self-test prints 340 assertions on Windows with Python 3.13 and 340 on Linux with
   Python 3.12, and the two outputs are identical line for line. No case is skipped. The one
   assertion that reads real access lists with `icacls` is true by construction off Windows, where
-  there is no list to read. That is why the count does not change.
+  there is no list to read. That is why the count does not change. The self-test also passes when the
+  system temp folder is the default `AppData\Local\Temp`.
 
 ## Contributing
 

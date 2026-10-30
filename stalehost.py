@@ -34,7 +34,7 @@ with an exit code built for a detect-and-remediate loop.
     python stalehost.py OLDHOST-1 --to NEWHOST --apply --passwords-stdin < logins.json
 
 Exit codes: 0 nothing to remediate, 1 stale content found or the scan could not
-be trusted, 64 usage error. Read EXIT CODE POLARITY below before changing them.
+be trusted, 64 usage error (including an argument argparse refuses). Read EXIT CODE POLARITY below before changing them.
 
 EXIT CODE POLARITY -- the tool is built for a detect-and-remediate loop
 (Microsoft Intune Remediations, or any fleet tool with the same shape):
@@ -70,10 +70,9 @@ the summary line, so both are diagnosable from the grid.
 WHY .sde IS INVENTORY AND NOT A VERDICT. A stale .sde is counted, sampled and
 reported, and by default it does not set exit 1, because the usual remediation
 cannot fix the .sde a real fleet has. A DBMS-authenticated .sde stores a
-database password, so repointing one needs a human to supply it: on the dry
-run that produced this tool, every one of the thousand-odd .sde files found was
-DBMS-auth and none was repointed. Without ArcGIS Pro on the device, arcpy cannot
-rewrite one at all. Letting .sde set exit 1 makes the loop re-run a remediation
+database password, so repointing one needs a human to supply it, and many of a
+real fleet's files are of that kind. Without ArcGIS Pro on the device, arcpy
+cannot rewrite one at all. Letting .sde set exit 1 makes the loop re-run a remediation
 forever on a device it can never clean. The sde= count is the manual worklist
 instead. Pass --fail-on-sde only when your remediation really can fix them,
 which is the case after --to and --apply with Pro's Python and the passwords on
@@ -89,13 +88,14 @@ property set -- so ArcGIS Pro's own Python rebuilds it with
 CreateDatabaseConnection in a child process. Passwords reach that child on its
 stdin and nowhere else: there is no flag for one and the environment is never
 read. Text files are not rewritten. After --apply the tree is scanned again and
-the exit code is the verdict for the tree as it now stands, so a file that could
-not be repointed still says STALE.
+the exit code is the verdict for the tree as it now stands, so an .aprx or .lyrx
+that could not be repointed still says STALE. A stale .sde that was declined,
+failed or needs a password stays SDEONLY, exit 0, unless --fail-on-sde is given.
 
 WHY TEXT IS INVENTORY TOO, AND WHY IT IS SCANNED AT ALL. The first version of
 this tool read three ArcGIS formats and nothing else. Pointed at a legacy
-automation share of several hundred files where about a fifth named the retiring
-host, one of them running nightly under Task Scheduler, it printed CLEAN over
+automation share where a large share of the scripts named the retiring host,
+one of them running nightly under Task Scheduler, it printed CLEAN over
 scanned=0. The PowerShell one-liner this tool exists to replace would have found
 every one of them. A detector that cannot see what its own remediation fixes is worse than the thing
 it replaced, so the text bucket is not optional.
@@ -115,6 +115,7 @@ import filecmp
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -132,8 +133,8 @@ FIXABLE_EXTENSIONS = (".aprx", ".lyrx")
 INVENTORY_EXTENSIONS = (".sde",)
 
 # Plain text that names a host in a connection. A scheduled .py is the common
-# one: on a legacy automation share of several hundred files, about a fifth
-# named the retiring host, one of them ran nightly under Task Scheduler, and this
+# one: on a legacy automation share a large share of the scripts named the
+# retiring host, one of them ran nightly under Task Scheduler, and this
 # tool read none of them and printed CLEAN over scanned=0. The list is short on purpose -- these six
 # are script and configuration types, where a host name is a connection rather
 # than prose. .txt is deliberately absent: a readme that mentions a server is
@@ -158,8 +159,8 @@ TEXT_SAMPLE_CAP = 3
 SAMPLE_WIDTH = 110
 
 # Directory names skipped at any depth. The first seven hold no user content.
-# node_modules and .git are here because a measured recon found zero .aprx,
-# .lyrx or .sde in either, and on a developer workstation they dominate the walk.
+# node_modules and .git are here because they hold no ArcGIS projects in the
+# trees this was run on, and on a developer workstation they dominate the walk.
 EXCLUDE_NAMES = frozenset([
     "windows", "program files", "program files (x86)", "programdata",
     "recycle.bin", "$recycle.bin", "system volume information",
@@ -167,16 +168,16 @@ EXCLUDE_NAMES = frozenset([
 ])
 
 # ArcGIS Pro drops ephemeral GUID-named .sde connection files straight into
-# AppData\Local\Temp and never cleans them up: thousands of them on the
-# workstation this was measured on, the single biggest cost in a full walk. They are
+# AppData\Local\Temp and never cleans them up: a very large number of them on a
+# long-used workstation, the biggest cost in a full walk. They are
 # per-session scratch, regenerated on the next launch, so repointing them is
 # pointless. --scan-temp includes them anyway. Slashes are normalised before
 # the comparison so the same rule can be tested on a non-Windows host.
 TEMP_FRAGMENT = "/appdata/local/temp"
 
-# Safety cap on total scan time. A pruned full-C: walk on a production
-# workstation measured 58 s, so 600 is roughly 10x headroom for a slower disk or
-# a larger user profile. It is not derived from any fleet tool's deadline.
+# Safety cap on total scan time. A pruned full-drive walk finished far inside
+# this on the author's workstation, so 600 leaves wide headroom for a slower
+# disk or a larger user profile. It is not derived from any fleet tool's deadline.
 DEFAULT_MAX_SECONDS = 600
 
 # Read caps. A .sde is a few kilobytes and a CIM part is rarely over a megabyte.
@@ -267,6 +268,10 @@ def host_needles(host):
     if host is None or not host.strip():
         raise ValueError("host name is empty")
     lowered = host.strip().lower()
+    if len(lowered) < 2:
+        # One ASCII character also matches inside every UTF-16LE character
+        # that has it, and the rewrite would then corrupt the wide bytes.
+        raise ValueError("host name must be at least 2 characters")
     try:
         ascii_needle = lowered.encode("ascii")
     except UnicodeEncodeError:
@@ -371,11 +376,24 @@ def normalise(path):
     return path.replace("\\", "/").lower()
 
 
-def skip_directory(name, path, include_temp=False):
+def inside_temp(path, root_length=0):
+    """True when path reaches into Temp at a point below the first root_length
+    characters. A root the caller named inside Temp is scanned on purpose, so
+    only a Temp folder that the walk itself finds below the root is pruned."""
+    text = normalise(path)
+    end = text.find(TEMP_FRAGMENT)
+    while end >= 0:
+        if end + len(TEMP_FRAGMENT) > root_length:
+            return True
+        end = text.find(TEMP_FRAGMENT, end + 1)
+    return False
+
+
+def skip_directory(name, path, include_temp=False, root_length=0):
     """True when the walk must not descend into this directory."""
     if name.lower() in EXCLUDE_NAMES:
         return True
-    if not include_temp and TEMP_FRAGMENT in normalise(path):
+    if not include_temp and inside_temp(path, root_length):
         return True
     return False
 
@@ -419,9 +437,9 @@ def verdict(walk, sde_is_work=False, text_is_work=False):
     # An unread text file leaves the device unproven whether or not text counts
     # as work, because it is the ordinary contract: a tree that could not be
     # finished is never reported clean. The .sde carve-out below is the one
-    # exception, and it is bought by a measurement -- over a thousand
-    # DBMS-authenticated files on one workstation, none of them repointable. Nothing measured says
-    # a locked .py is that common, so it does not get the same excuse.
+    # exception: most connection files on a workstation store a database login
+    # and cannot be repointed unattended, so an unread one is not work. Nothing
+    # says a locked .py is that common, so it does not get the same excuse.
     if walk.unreadable_text:
         return UNVERIFIED, 1
     if sde_is_work and walk.unreadable_sde:
@@ -529,6 +547,20 @@ def scrub(text, secrets):
     return text
 
 
+def remove_file(path, remove=os.remove):
+    """Delete a file, clearing the read-only bit first when Windows insists.
+
+    A copy of a read-only project is read-only too, so a cleanup that skipped
+    this would leave the staged file and the backup behind and hide the error
+    that caused the cleanup.
+    """
+    try:
+        remove(path)
+    except PermissionError:
+        os.chmod(path, stat.S_IWRITE)
+        remove(path)
+
+
 def parse_passwords(data):
     """Parse the JSON object on stdin into {lower-case login: password}.
 
@@ -613,6 +645,8 @@ def summary_line(state, host, walk, pro, text_exts=TEXT_EXTENSIONS):
     # Printed only when they changed the verdict, so the common case stays short.
     if walk.unreadable_fix or walk.unreadable_text:
         line += " unverified=%d" % (walk.unreadable_fix + walk.unreadable_text)
+    if walk.skipped_dirs:
+        line += " skippeddirs=%d" % walk.skipped_dirs
     if walk.root_failed:
         line += " rootfail=yes"
     if walk.timed_out:
@@ -631,7 +665,7 @@ class Walk(object):
     def __init__(self, aprx=0, lyrx=0, sde=0, unreadable_fix=0,
                  unreadable_sde=0, root_failed=False, timed_out=False,
                  scanned=0, elapsed=0, samples=None, sde_samples=None,
-                 text=0, unreadable_text=0, text_samples=None):
+                 text=0, unreadable_text=0, text_samples=None, skipped_dirs=0):
         self.aprx = aprx
         self.lyrx = lyrx
         self.sde = sde
@@ -639,6 +673,7 @@ class Walk(object):
         self.unreadable_fix = unreadable_fix    # unread .aprx or .lyrx
         self.unreadable_sde = unreadable_sde    # unread .sde
         self.unreadable_text = unreadable_text  # unread text file
+        self.skipped_dirs = skipped_dirs        # folders that would not list
         self.root_failed = root_failed
         self.timed_out = timed_out
         self.scanned = scanned
@@ -662,6 +697,7 @@ class Walk(object):
             "unreadableFixable": self.unreadable_fix,
             "unreadableSde": self.unreadable_sde,
             "unreadableText": self.unreadable_text,
+            "skippedDirectories": self.skipped_dirs,
             "rootFailed": self.root_failed,
             "timedOut": self.timed_out,
             "elapsedSeconds": self.elapsed,
@@ -758,12 +794,11 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
               text_exts=TEXT_EXTENSIONS, hits=None):
     """Walk the roots and count what names the host. Never raises for one file.
 
-    An explicit stack, not os.walk and not a recursive helper. The equivalent
-    one-liner on the shell this was deployed from aborts the entire enumeration
-    on the first access-denied directory and returns nothing, which a fleet tool
-    reads as a healthy device. A per-directory try/except degrades instead of
-    lying: the directory is skipped, the counter that says so is raised, and the
-    verdict reflects it.
+    An explicit stack, not os.walk and not a recursive helper. A per-directory
+    try/except degrades instead of raising: the directory is skipped and the
+    counter that says so is raised. A root that will not list changes the
+    verdict. A subfolder that will not list is counted in skippeddirs and does
+    not, because protected folders are routine on Windows.
 
     hits, when a list is given, receives (path, extension) for every stale file,
     not only the capped samples. The remediation needs all of them.
@@ -783,7 +818,9 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
     scanned_extensions = SCANNED_EXTENSIONS + tuple(text_exts)
     root_keys = set(normalise(root) for root in roots)
     started = clock()
-    stack = list(roots)
+    # Each entry carries the length of the root it came from, so the Temp prune
+    # looks only below that root.
+    stack = [(root, len(normalise(root))) for root in roots]
 
     # Roots are pushed without a name check on purpose: a caller may point
     # --path at a folder that lives inside an excluded tree, which is what the
@@ -792,7 +829,7 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
         if clock() - started >= max_seconds:
             walk.timed_out = True
             break
-        current = stack.pop()
+        current, root_length = stack.pop()
 
         # Materialised inside the try on purpose. scandir hands back a lazy
         # iterator, so without list() the access-denied error surfaces in the
@@ -803,6 +840,8 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
             entries = []
             if failure_is_root(current, root_keys):
                 walk.root_failed = True
+            else:
+                walk.skipped_dirs += 1
 
         subdirectories = []
         for entry in entries:
@@ -811,6 +850,7 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
                     subdirectories.append(entry)
                     continue
             except OSError:
+                walk.skipped_dirs += 1
                 continue
             extension = os.path.splitext(entry.name)[1].lower()
             if extension not in scanned_extensions:
@@ -852,11 +892,12 @@ def scan_tree(roots, host, max_seconds=DEFAULT_MAX_SECONDS, include_temp=False,
                     walk.text_samples.append(entry.path)
 
         for entry in subdirectories:
-            if skip_directory(entry.name, entry.path, include_temp):
+            if skip_directory(entry.name, entry.path, include_temp,
+                              root_length):
                 continue
             if is_reparse(entry):
                 continue
-            stack.append(entry.path)
+            stack.append((entry.path, root_length))
 
     walk.elapsed = int(clock() - started)
     return walk
@@ -944,9 +985,13 @@ def scan_roots(path, roots_source=None):
 
 # ------------------------------------------------------- remediation (files)
 
-def describe_error(exc):
-    """One short line for a failure. The exception type first, then its text."""
-    return ("%s: %s" % (type(exc).__name__, exc))[:200]
+def describe_error(exc, secrets=()):
+    """One short line for a failure. The exception type first, then its text.
+
+    Secrets are removed before the cut, so a password that straddles the 200
+    character limit is not left half showing.
+    """
+    return scrub("%s: %s" % (type(exc).__name__, exc), secrets)[:200]
 
 
 def result_row(path, status, detail="", backup=""):
@@ -1041,6 +1086,7 @@ def copy_acl(source, target, importer=_import_ctypes):
         source, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None,
         ctypes.byref(dacl), None, ctypes.byref(descriptor))
     if code:
+        # Nothing was allocated when the call fails, so there is nothing to free.
         raise OSError("cannot read the access list of the file (error %d)"
                       % code)
     try:
@@ -1085,8 +1131,8 @@ def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
     if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
         raise ValueError("the file changed while it was being rewritten")
     backup = backup_path(path, now)
-    copy(path, backup)
     try:
+        copy(path, backup)
         if not filecmp.cmp(path, backup, shallow=False):
             raise ValueError("the backup does not match the original")
         shutil.copymode(path, staged)
@@ -1094,7 +1140,10 @@ def swap_in(path, staged, before, now, replace=os.replace, copy=shutil.copy2,
         acl(path, staged)
         replace(staged, path)
     except Exception:
-        os.remove(backup)
+        # A copy that failed part way leaves a truncated backup that looks like
+        # a good one. The original is untouched in every case that gets here.
+        if os.path.isfile(backup):
+            remove_file(backup)
         raise
     return backup
 
@@ -1117,7 +1166,7 @@ def repoint_file(path, extension, host, new, now, replace=os.replace,
                           acl)
     finally:
         if os.path.isfile(temp):
-            os.remove(temp)
+            remove_file(temp)
     return count, backup
 
 
@@ -1169,7 +1218,7 @@ def sde_worker(job, loader, out):
         try:
             status, detail = _sde_one(arcpy, path, job)
         except Exception as exc:
-            status, detail = "failed", describe_error(exc)
+            status, detail = "failed", describe_error(exc, secrets)
         out.write(RESULT_MARK + json.dumps(
             {"path": path, "status": status,
              "detail": scrub(detail, secrets)}) + "\n")
@@ -1190,7 +1239,7 @@ def run_sde_worker(python, script, job, timeout=SDE_WORKER_SECONDS):
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
     except OSError as exc:
-        return {}, scrub(describe_error(exc), secrets)
+        return {}, describe_error(exc, secrets)
     try:
         out, err = child.communicate(json.dumps(job).encode("utf-8"),
                                      timeout=timeout)
@@ -1209,8 +1258,8 @@ def run_sde_worker(python, script, job, timeout=SDE_WORKER_SECONDS):
     problem = ""
     if child.returncode != 0:
         tail = err.decode("utf-8", "replace").strip().splitlines()[-1:]
-        problem = scrub("the ArcGIS Pro Python exited %d %s"
-                        % (child.returncode, "".join(tail)[:120]), secrets)
+        problem = "the ArcGIS Pro Python exited %d %s" % (
+            child.returncode, scrub("".join(tail), secrets)[:120])
     return results, problem
 
 
@@ -1224,12 +1273,17 @@ def repoint_sde(paths, host, new, apply, passwords, python, now, script,
         return [result_row(path, "would", "recreate with ArcGIS Pro Python")
                 for path in paths]
     secrets = list(passwords.values())
-    befores = dict((path, os.stat(path)) for path in paths)
-    absolute = dict((os.path.abspath(path), path) for path in paths)
+    rows = []
+    befores = {}
+    for path in paths:
+        try:
+            befores[path] = os.stat(path)
+        except OSError as exc:
+            rows.append(result_row(path, "failed", describe_error(exc)))
+    absolute = dict((os.path.abspath(path), path) for path in befores)
     job = {"old": host, "new": new, "files": sorted(absolute),
            "passwords": passwords}
     reported, problem = run_sde_worker(python, script, job, timeout)
-    rows = []
     for full in sorted(absolute):
         path = absolute[full]
         temp = sde_temp_path(path)
@@ -1244,10 +1298,10 @@ def repoint_sde(paths, host, new, apply, passwords, python, now, script,
                 rows.append(result_row(path, status, scrub(detail, secrets)))
         except Exception as exc:
             rows.append(result_row(path, "failed",
-                                   scrub(describe_error(exc), secrets)))
+                                   describe_error(exc, secrets)))
         finally:
             if os.path.isfile(temp):
-                os.remove(temp)
+                remove_file(temp)
     return rows
 
 
@@ -1456,6 +1510,8 @@ def self_test():
         # ---- the needle, and what is not a needle
         raises(lambda: host_needles(""), "an empty host name is refused")
         raises(lambda: host_needles("   "), "a blank host name is refused")
+        raises(lambda: host_needles("a"),
+               "a one character host name is refused, because it matches inside utf-16-le text  <-- pinned defect")
         raises(lambda: host_needles(u"OLDH\u00d6ST"),
                "a non-ASCII host name is refused rather than never matching")
         check(host_needles(host)[0] == b"oldhost-1",
@@ -1481,6 +1537,10 @@ def self_test():
               "and a hyphenated prefix does not make OLDHOST a whole token  <-- pinned defect")
         check(bytes_contain_host(b"SERVER=OLDHOST-1", host),
               "the end of the buffer is a boundary")
+        check(not bytes_contain_host(b"xOLDHOST-1", host),
+              "a word byte right before the host, at byte 1, is not a boundary  <-- pinned defect")
+        check(bytes_contain_host(b"xa.a.a", "a.a"),
+              "a host that overlaps itself is found at its second start  <-- pinned defect")
         check(bytes_contain_host(b"server=oldhost-1,1433;", host),
               "a host followed by a port is a hit")
         check(bytes_contain_host(b"SERVER=oldhost-1\\SQLEXPRESS;", host),
@@ -1504,6 +1564,10 @@ def self_test():
               "a utf-16-le host at the end of the buffer is a hit")
         check(not bytes_contain_host(u"MYOLDHOST-1".encode("utf-16-le"), host),
               "a longer utf-16-le name ending in the host is not a hit")
+        check(not bytes_contain_host(u"xOLDHOST-1".encode("utf-16-le"), host),
+              "a utf-16-le word unit right before the host, at byte 2, is not a boundary  <-- pinned defect")
+        check(not bytes_contain_host(u"OLDHOST-1x".encode("utf-16-le"), host),
+              "a utf-16-le word unit as the last unit after the host is not a boundary  <-- pinned defect")
 
         # ---- format routing
         check(looks_like_zip(b"PK\x03\x04rest"), "a PK header is a zip")
@@ -1643,7 +1707,7 @@ def self_test():
               "a .git directory is never walked")
         check(all("node_modules" not in normalise(p) for p in walk.samples),
               "a node_modules directory is never walked")
-        check(all(TEMP_FRAGMENT not in normalise(p) for p in walk.sde_samples),
+        check(not any(p.endswith("scratch.sde") for p in walk.sde_samples),
               "the AppData Local Temp scratch is pruned by default  <-- pinned defect")
         check(all(not p.endswith("conn.sde") for p in walk.sde_samples),
               "a directory named conn.sde is not counted as a file")
@@ -1760,6 +1824,36 @@ def self_test():
         denied = scan_tree([tree], host, lister=denied_subdirectory_lister)
         check(denied.root_failed is False and denied.scanned == 2,
               "one unreadable subdirectory does not flag the device, the rest is still read  <-- pinned defect")
+        check(denied.skipped_dirs == 1 and half.skipped_dirs == 0,
+              "a subdirectory that will not list is counted, and a root that will not list is not  <-- pinned defect")
+        check(" skippeddirs=1 " in summary_line(CLEAN, host, denied, "no")
+              and "skippeddirs" not in summary_line(CLEAN, host, Walk(), "no"),
+              "the count is on the summary line only when it is not zero")
+        check(denied.to_dict(CLEAN, 0, host, "no")["skippedDirectories"] == 1,
+              "and it is a field in the JSON report")
+        check(verdict(Walk(skipped_dirs=3)) == (CLEAN, 0),
+              "a skipped subdirectory alone does not change the verdict, by design; the count is the evidence")
+
+        # ---- the Temp prune looks only below the root that was named
+        temp_root = os.path.join(workdir, "AppData", "Local", "Temp", "named")
+        os.makedirs(os.path.join(temp_root, "maps"))
+        shutil.copy(stale_aprx, os.path.join(temp_root, "maps", "p.aprx"))
+        named = scan_tree([temp_root], host)
+        check(named.aprx == 1 and named.scanned == 1,
+              "a root the caller named inside Temp is scanned all the way down  <-- pinned defect")
+        local_root = os.path.join(workdir, "AppData", "Local")
+        check(scan_tree([local_root], host).scanned == 0
+              and scan_tree([local_root], host, include_temp=True).aprx == 1,
+              "a Temp folder found below the root is still pruned, and --scan-temp reaches it")
+        check(not inside_temp("c:/u/appdata/local/temp/p/maps", 25)
+              and inside_temp("c:/u/appdata/local/temp", 12)
+              and inside_temp("c:/u/appdata/local/temp/a/appdata/local/temp", 25),
+              "inside_temp compares where the Temp fragment ends with where the root ends")
+        upper_dir = os.path.join(workdir, "upper_ext")
+        os.makedirs(upper_dir)
+        shutil.copy(stale_aprx, os.path.join(upper_dir, "X.APRX"))
+        check(scan_tree([upper_dir], host).aprx == 1,
+              "an upper-case extension is read as the extension it is  <-- pinned defect")
 
         # A junction cannot be created on every host this has to be green on, so
         # the entry is simulated. is_reparse and the walk are the real ones.
@@ -1817,6 +1911,10 @@ def self_test():
         check(scan_tree([tree], host,
                         lister=entry_lister(unstattable)).scanned == 0,
               "an entry that will not stat is refused rather than followed blind")
+        odd = scan_tree([tree], host, lister=entry_lister(
+            FakeEntry("Odd2", projects, dir_raises=True)))
+        check(odd.scanned == 0 and odd.skipped_dirs == 1,
+              "an entry that cannot say whether it is a directory is counted as skipped")
         check(is_reparse(junction) is True and is_reparse(plain) is False,
               "and that decision is the reparse attribute, read off the entry")
 
@@ -2184,6 +2282,13 @@ def self_test():
               "the new connection is built beside the old one and still ends in .sde")
         check(scrub("x abcdef y abc", ["abc", "abcdef"]) == "x *** y ***",
               "a password that holds another is removed whole, longest first  <-- pinned defect")
+        check(scrub("pw then pw again", ["pw"]) == "*** then *** again",
+              "a password quoted twice in one message is removed both times  <-- pinned defect")
+        long_error = RuntimeError("x" * 181 + " hunter2-SECRET")
+        check("hunt" not in describe_error(long_error, ["hunter2-SECRET"]),
+              "a password that straddles the 200 character cut leaves no prefix behind  <-- pinned defect")
+        check(len(describe_error(long_error, ["hunter2-SECRET"])) <= 200,
+              "and an error line is still cut to 200 characters")
         check(parse_passwords(b'\xef\xbb\xbf{"SDE_User": "pw1", "Other": "p w2"}')
               == {"sde_user": "pw1", "other": "p w2"},
               "logins are matched without regard to case, and a BOM is tolerated")
@@ -2478,8 +2583,7 @@ def self_test():
             return sorted(line.split(path)[-1].strip()
                           for line in text.splitlines()[:-2] if line.strip())
 
-        real_acl_ok = True
-        if sys.platform == "win32":
+        def icacls_round_trip():
             locked = stale_copy(stale_lyrx, "locked_down.lyrx")
             subprocess.check_call(["icacls", locked, "/inheritance:r"],
                                   stdout=subprocess.PIPE)
@@ -2488,10 +2592,11 @@ def self_test():
                                   stdout=subprocess.PIPE)
             before_list = listing(locked)
             count, kept = repoint_file(locked, ".lyrx", host, new, 0)
-            real_acl_ok = (len(before_list) == 1
-                           and listing(locked) == before_list
-                           and listing(kept) == before_list)
-        check(real_acl_ok,
+            return (len(before_list) == 1
+                    and listing(locked) == before_list
+                    and listing(kept) == before_list)
+
+        check(sys.platform != "win32" or icacls_round_trip(),
               "a project locked to one account is still locked after the rewrite, and so is its backup (read from icacls on Windows)  <-- pinned defect")
         raises(lambda: verify_rewrite(stale_lyrx, ".lyrx", host, new),
                "a rewrite that still names the old host is refused")
@@ -2652,12 +2757,163 @@ def self_test():
         hang = os.path.join(workdir, "hang.sde")
         stub_sde(hang, **dict(osa, behaviour="hang"))
         original = read_bytes(hang)
-        rows = repoint_sde([hang], host, new, True, {}, sys.executable, 0,
-                           script, timeout=1)
+        real_popen = subprocess.Popen
+
+        class _Spy(real_popen):
+            killed = []
+
+            def kill(self):
+                _Spy.killed.append(self.pid)
+                real_popen.kill(self)
+
+        subprocess.Popen = _Spy
+        try:
+            rows = repoint_sde([hang], host, new, True, {}, sys.executable, 0,
+                               script, timeout=1)
+        finally:
+            subprocess.Popen = real_popen
+        check(len(_Spy.killed) == 1,
+              "the hung worker is killed, not left running  <-- pinned defect")
         check(rows[0]["status"] == "failed"
               and "did not finish" in rows[0]["detail"]
               and read_bytes(hang) == original,
               "a worker that hangs on a dead database is killed and counted, and the file is untouched  <-- pinned defect")
+
+        # ---- cleanup that must work on a read-only project
+        ro_file = os.path.join(workdir, "readonly.bin")
+        _write(ro_file, b"x")
+        os.chmod(ro_file, stat.S_IREAD)
+        remove_file(ro_file)
+        check(not os.path.exists(ro_file),
+              "a read-only file is removed, because its copies are read-only too  <-- pinned defect")
+        calls = []
+
+        def removes_on_second_try(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, "access is denied")
+            os.remove(path)
+
+        stuck = os.path.join(workdir, "stuck.bin")
+        _write(stuck, b"x")
+        remove_file(stuck, remove=removes_on_second_try)
+        check(len(calls) == 2 and not os.path.exists(stuck),
+              "a removal that is refused is retried once after the read-only bit is cleared, on every host")
+
+        target = stale_copy(stale_lyrx, "readonly.lyrx")
+        original = read_bytes(target)
+        os.chmod(target, stat.S_IREAD)
+        modes = []
+
+        def failing_replace(staged, destination):
+            modes.append(os.stat(staged).st_mode & stat.S_IWRITE)
+            raise PermissionError(13, "the file is in use")
+
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               replace=failing_replace))
+        os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+        check(isinstance(problem, PermissionError) and "in use" in str(problem)
+              and read_bytes(target) == original
+              and not os.path.exists(target + TEMP_MARK)
+              and not backups_of("readonly.lyrx"),
+              "a rename that fails on a read-only project reports the rename and leaves nothing behind  <-- pinned defect")
+        check(modes == [0],
+              "the staged file takes the original's read-only mode before the swap")
+
+        def partial_copy(source, destination):
+            _write(destination, b"half")
+            raise OSError(28, "no space left on device")
+
+        target = stale_copy(stale_lyrx, "partial.lyrx")
+        original = read_bytes(target)
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               copy=partial_copy))
+        check(isinstance(problem, OSError) and read_bytes(target) == original
+              and not backups_of("partial.lyrx"),
+              "a backup copy that fails part way is removed, not left looking like a good one  <-- pinned defect")
+
+        def refused_copy(source, destination):
+            raise OSError(5, "access denied")
+
+        target = stale_copy(stale_lyrx, "nocopy.lyrx")
+        problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0,
+                                               copy=refused_copy))
+        check(isinstance(problem, OSError) and not backups_of("nocopy.lyrx"),
+              "a backup copy that fails before it writes anything has nothing to remove")
+
+        def swap_after(path, change):
+            """swap_in on path after change() ran. Return the exception or None."""
+            before = os.stat(path)
+            staged = path + TEMP_MARK
+            _write(staged, b"staged")
+            change()
+            try:
+                return outcome(lambda: swap_in(path, staged, before, 0))
+            finally:
+                os.remove(staged)
+
+        target = stale_copy(stale_lyrx, "samesize.lyrx")
+        stamp = os.stat(target)
+        problem = swap_after(target, lambda: (
+            _write(target, b"y" * stamp.st_size),
+            os.utime(target, ns=(stamp.st_atime_ns,
+                                 stamp.st_mtime_ns + 5000000000))))
+        check(isinstance(problem, ValueError) and not backups_of("samesize.lyrx"),
+              "a save that keeps the size but moves the time stamp is refused  <-- pinned defect")
+        target = stale_copy(stale_lyrx, "sametime.lyrx")
+        stamp = os.stat(target)
+        problem = swap_after(target, lambda: (
+            _write(target, b"y" * (stamp.st_size + 3)),
+            os.utime(target, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))))
+        check(isinstance(problem, ValueError) and not backups_of("sametime.lyrx"),
+              "a save that keeps the time stamp but changes the size is refused  <-- pinned defect")
+
+        real_rewrite_into = rewrite_into
+        globals()["rewrite_into"] = lambda path, extension, temp, old, newer: (
+            shutil.copy(path, temp), 1)[1]
+        try:
+            target = stale_copy(stale_lyrx, "unverified.lyrx")
+            original = read_bytes(target)
+            problem = outcome(lambda: repoint_file(target, ".lyrx", host, new, 0))
+        finally:
+            globals()["rewrite_into"] = real_rewrite_into
+        check(isinstance(problem, ValueError) and "still names" in str(problem)
+              and read_bytes(target) == original
+              and not backups_of("unverified.lyrx"),
+              "a rewrite that did not remove the old host is refused before any swap  <-- pinned defect")
+
+        gone = os.path.join(workdir, "vanished.sde")
+        rows = repoint_sde([gone], host, new, True, {}, sys.executable, 0,
+                           silent)
+        check(len(rows) == 1 and rows[0]["status"] == "failed"
+              and "Error" in rows[0]["detail"],
+              "an .sde that vanished before the rebuild is a failed row, not a crash  <-- pinned defect")
+
+        mover = os.path.join(workdir, "mover_worker.py")
+        _write(mover, (
+            "import json, sys\n"
+            "job = json.loads(sys.stdin.read())\n"
+            "for p in job['files']:\n"
+            "    open(p[:-4] + '-stalehost-tmp.sde', 'wb').write(b'server=NEWHOST;')\n"
+            "    open(p, 'ab').write(b'x')\n"
+            "    print('STALEHOST-RESULT ' + json.dumps({'path': p, "
+            "'status': 'created', 'detail': ''}))\n").encode("ascii"))
+        moving = os.path.join(workdir, "moving.sde")
+        stub_sde(moving, **osa)
+        moved_from = read_bytes(moving)
+        rows = repoint_sde([moving], host, new, True, {}, sys.executable, 0,
+                           mover)
+        check(rows[0]["status"] == "failed" and "changed" in rows[0]["detail"]
+              and read_bytes(moving) == moved_from + b"x"
+              and not os.path.exists(sde_temp_path(moving)),
+              "an .sde saved while the worker ran is not overwritten  <-- pinned defect")
+
+        loud = os.path.join(workdir, "loud_worker.py")
+        _write(loud, b"import sys\nsys.stderr.write('x' * 115 + 'S3cret' + 'Pw\\n')\nsys.exit(3)\n")
+        results, problem = run_sde_worker(
+            sys.executable, loud, {"passwords": {"u": secret}, "files": []})
+        check("S3c" not in problem and "exited 3" in problem,
+              "a password that straddles the 120 character stderr cut leaves no prefix behind  <-- pinned defect")
 
         # ---- a whole tree, end to end, through main()
         pw_stdin = lambda: io.TextIOWrapper(io.BytesIO(
@@ -2878,7 +3134,7 @@ def self_test():
         check(args.json is False, "--json defaults to OFF")
         check(args.path is None, "--path defaults to every local fixed drive")
         check(args.max_seconds == 600,
-              "--max-seconds defaults to the measured 10x headroom")
+              "--max-seconds defaults to 600 seconds")
         check(_parse([host, "--fail-on-sde"]).fail_on_sde is True,
               "--fail-on-sde is read")
         check(_parse([host, "--scan-temp"]).scan_temp is True, "--scan-temp is read")
@@ -2926,6 +3182,23 @@ def self_test():
               "a unique prefix of --pro-python is refused by the parser")
         check(_parse(["--sde-worker", "--apply"]).sde_worker,
               "the internal worker flag parses")
+
+        def parse_exit_code(argv):
+            saved_err = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                _parse(argv)
+            except SystemExit as stop:
+                return stop.code
+            finally:
+                sys.stderr = saved_err
+            return None
+
+        check(parse_exit_code([host]) is None
+              and parse_exit_code([host, "--to", "NEWHOST", "--ap"]) == 64
+              and parse_exit_code([host, "--no-such-flag"]) == 64
+              and parse_exit_code([host, "--path"]) == 64,
+              "a refused abbreviation, an unknown flag and a missing value all exit 64, not 2  <-- pinned defect")
     finally:
         WORKER_SCRIPT = saved_script
         shutil.rmtree(workdir, ignore_errors=True)
@@ -2935,8 +3208,20 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+USAGE_EXIT = 64
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a bad argument. This tool documents 64 for that."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        sys.exit(USAGE_EXIT)
+
+
 def _parse(argv):
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="stalehost.py",
         allow_abbrev=False,
         description="Find every ArcGIS file on this device that still names the "
@@ -2977,7 +3262,7 @@ def _parse(argv):
                              % ",".join(TEXT_EXTENSIONS))
     parser.add_argument("--scan-temp", dest="scan_temp", action="store_true",
                         help="include AppData\\Local\\Temp, where Pro leaves "
-                             "thousands of scratch .sde connections")
+                             "many scratch .sde connections")
     parser.add_argument("--json", action="store_true",
                         help="emit the result as JSON instead of the text line")
     parser.add_argument("--to", dest="to", default=None, metavar="NEWHOST",
